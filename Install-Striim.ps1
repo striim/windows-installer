@@ -1542,7 +1542,7 @@ function Find-JavaInstallations {
             }
         }
     }
-    return @($findings)
+    return ,@($findings)
 }
 
 function Test-Java17Resolvable {
