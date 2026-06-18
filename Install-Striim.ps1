@@ -3261,11 +3261,18 @@ function Invoke-PlanHandoff {
     $planPath = Join-Path $script:ScriptDir 'install-plan.json'
     Save-PlanFile -Plan $Plan -Path $planPath
     Write-Log -Level Info -Message 'One UAC prompt follows - the elevated process executes the whole plan unattended.'
-    $exitCode = Invoke-ElevatedExecution -PlanPath $planPath
-    if ($exitCode -ne 0) {
-        Write-Log -Level Warn -Message "Elevated installer exited with code $exitCode. Check the transcript under <install>\logs."
+    try {
+        $exitCode = Invoke-ElevatedExecution -PlanPath $planPath
+        if ($exitCode -ne 0) {
+            Write-Log -Level Warn -Message "Elevated installer exited with code $exitCode. Check the transcript under <install>\logs."
+        }
+        if (Test-Path $planPath) { Remove-Item -Path $planPath -Force -ErrorAction SilentlyContinue }
+    } catch {
+        Write-Log -Level Warn -Message "UAC elevation failed: $($_.Exception.Message)"
+        Write-Log -Level Warn -Message "Your install plan was saved to: $planPath"
+        Write-Log -Level Warn -Message "Open an already-elevated PowerShell prompt and run:"
+        Write-Log -Level Warn -Message "  & '$($script:ScriptPath)' -PlanFile '$planPath'"
     }
-    if (Test-Path $planPath) { Remove-Item -Path $planPath -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-FreshInstallFlow {
@@ -3317,6 +3324,23 @@ function Invoke-Main {
         }
         Read-Host -Prompt 'Press Enter to close this window' | Out-Null
         return
+    }
+
+    # Branch 2b: already elevated and a saved plan exists (e.g. prior UAC-blocked attempt).
+    $savedPlanPath = Join-Path $script:ScriptDir 'install-plan.json'
+    if ((Test-IsAdmin) -and (Test-Path $savedPlanPath)) {
+        Write-Log -Level Info -Message "Found a saved install plan at: $savedPlanPath"
+        if (Confirm-UserChoice -Prompt 'Resume from saved plan?' -DefaultChoice 'y') {
+            $plan = Read-PlanFile -Path $savedPlanPath
+            try {
+                Invoke-PlanExecution -Plan $plan
+            } finally {
+                Remove-Item -Path $savedPlanPath -Force -ErrorAction SilentlyContinue
+            }
+            Read-Host -Prompt 'Press Enter to close this window' | Out-Null
+            return
+        }
+        Remove-Item -Path $savedPlanPath -Force -ErrorAction SilentlyContinue
     }
 
     # Branch 3: detect -> maintenance menu (existing install) or interview -> plan -> execute (fresh).
