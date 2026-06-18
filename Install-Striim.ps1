@@ -558,7 +558,7 @@ function Invoke-StepList {
         while (-not $done) {
             $err = ''
             try {
-                & $step.Action
+                & $step.Action | Out-Host
                 $passed = [bool](& $step.Test)
             } catch {
                 $passed = $false
@@ -1314,6 +1314,15 @@ function New-InstallPlan {
     if (-not $Interview.ClusterReachable) {
         [void]$warnings.Add("cluster auth port $($Interview.AuthPort) on $($Interview.ServerAddress) was unreachable from this host")
     }
+    if ($Interview.IntegratedSecurity) {
+        $dllPreInstall = @(
+            (Join-Path $script:ScriptDir 'sqljdbc_auth.dll'),
+            (Join-Path $script:DownloadDir 'sqljdbc_auth.dll')
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $dllPreInstall) {
+            [void]$warnings.Add("sqljdbc_auth.dll not found next to the script or in downloads\ - the step will also check Striim's lib\ after extraction, but place the DLL next to this script now to be safe")
+        }
+    }
     if ($Probes.OleDb.Present -and -not $Probes.OleDb.KnownGood) {
         [void]$warnings.Add("OLE DB Driver $($Probes.OleDb.Version) is installed but not in the known-good list ($($script:KnownGoodOleDbVersions -join ', ')) - proceeding anyway")
     }
@@ -1952,8 +1961,7 @@ function Invoke-KeystoreConfig {
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
     $batPath = Join-Path $iv.InstallPath $artifacts.KeystoreScript
     if (-not (Test-Path $batPath)) { throw "Keystore script not found: $batPath" }
-    $batDir = Split-Path -Parent $batPath
-    Push-Location $batDir
+    Push-Location $iv.InstallPath
     try {
         if ($iv.KeystorePassword -and $iv.SysPassword) {
             $ksPlain = ConvertTo-PlainText -Secure $iv.KeystorePassword
