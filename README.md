@@ -231,7 +231,7 @@ The interview is collected in the exact order below. Where a value can be prefil
 | **Install profile** | A pick list — `1` selects the Agent (default), `2` selects a Node. |
 | **Striim version** | Defaults to `5.4.0.6`. The wizard immediately checks the release server for that version, so a typo fails in about a second instead of after a long download. Versions below 5.0 are rejected; early 5.0.x builds (before ~5.0.6, the Java 11 era) get a warning and a confirmation. |
 | **Install path** | A free-space table of all fixed drives is shown. Enter a drive letter (e.g. `D`) for the standard layout, or type a full path. The 500 MB / 10%-free checks run against the drive you actually picked. |
-| **Restore a prior config backup?** *(only when backups exist)* | If `<drive>:\striim_backups\` holds backups, a pick list shows them newest-first with what each contains. The chosen backup's cluster settings become press-Enter defaults; its keystore pair and non-default JDBC jars are copied back automatically after extraction. |
+| **Restore a prior config backup?** *(only when backups exist)* | If `<drive>:\striim_backups\` holds backups, a pick list shows them newest-first with what each contains. The chosen backup's cluster settings become press-Enter defaults; its keystore pair, `log4j*.properties` logging config, and non-default JDBC jars are copied back automatically after extraction. |
 | **Cluster name / Server address / HTTPS** | The Striim cluster this agent joins, a server node hostname/IP, and whether HTTPS is enabled (auth port `9081` for HTTPS, `9080` for HTTP). The wizard probes the address/port immediately and warns **now** if it's unreachable. |
 | **License details** *(Node only)* | `CompanyName`, `LicenceKey`, and `ProductKey` — required for a Node, never asked for an Agent. |
 | **MEM_MAX** | Optional JVM max-heap value (e.g. `2048m`). Press Enter to skip. |
@@ -459,7 +459,7 @@ Select:
 | **3 — Update Striim settings** | Re-asks the cluster settings, server address, HTTPS, and JVM heap, then rewrites **both** `agent.conf` **and** the service `wrapper.conf`, and restarts the service. See [Conflict-aware settings update](#conflict-aware-settings-update-option-3) below. |
 | **4 — Manage service** | Shows the live service status, the account it runs under, and its PID, then lets you **Start**, **Stop**, or **Restart** the service from inside the wizard. See [Manage service](#manage-service-option-4) below. |
 | **5 — Clean reinstall** | First offers the same config backup as uninstall (default **yes**, to `<drive>:\striim_backups\reinstall_<version>_<timestamp>\`), then clears the install directory — **always preserving** `downloads\`, `logs\`, and the installer scripts — and runs the full interview and install again. |
-| **6 — Upgrade version** | The official upgrade procedure as one plan. Settings are read from the live config **before anything is touched**; the wizard then backs everything up to `<drive>:\striim_backups\upgrade_<oldversion>_<timestamp>\` (mandatory), stops and deregisters the old service (the wrapper is version-specific), cleans the directory, installs the new version, restores your keystore and non-default JDBC jars, and re-registers the service. See [Upgrade](#upgrade-version-option-6) below. |
+| **6 — Upgrade version** | The official upgrade procedure as one plan. Settings are read from the live config **before anything is touched**; the wizard then backs everything up to `<drive>:\striim_backups\upgrade_<oldversion>_<timestamp>\` (mandatory), stops and deregisters the old service (the wrapper is version-specific), cleans the directory, installs the new version, restores your keystore, log4j logging config, and non-default JDBC jars, and re-registers the service. See [Upgrade](#upgrade-version-option-6) below. |
 | **7 — Uninstall** | Full removal — see [Uninstalling](#uninstalling). |
 | **8 — New install** | Runs the full install interview even though an install was detected — for a second copy on another path, the other profile, or rebuilding a broken install. If the path you pick is the detected install's own path, the wizard switches to a clean-reinstall plan automatically (with the backup offer). |
 
@@ -524,7 +524,7 @@ Installed version: 5.4.0.6. Enter the version to upgrade to.
 Striim version to install [5.4.0.6]: 5.5.0.1
 ```
 
-If the target isn't newer than the installed version, you're warned and asked to confirm. The agent keeps its cluster identity — no keystore re-enrollment, no retyped settings — because the keystore and non-default jars are restored from the mandatory pre-upgrade backup.
+If the target isn't newer than the installed version, you're warned and asked to confirm. The agent keeps its cluster identity — no keystore re-enrollment, no retyped settings — because the keystore, log4j logging config, and non-default jars are restored from the mandatory pre-upgrade backup.
 
 ---
 
@@ -533,12 +533,12 @@ If the target isn't newer than the installed version, you're warned and asked to
 Choose **[7] Uninstall** from the maintenance menu. Before anything happens, you answer three questions (all unelevated):
 
 ```
-Back up conf\agent.conf, the keystore pair, and non-default lib\ jars to C:\striim_backups\uninstall_5.4.0.6_20260616-101500 first? (Y/n): y
+Back up conf\agent.conf, the keystore pair, log4j config, and non-default lib\ jars to C:\striim_backups\uninstall_5.4.0.6_20260616-101500 first? (Y/n): y
 Keep the downloads\ cache (useful for a future reinstall; it will move next to the backup dir)? (Y/n): y
 Also remove sqljdbc_auth.dll from System32? Other SQL tooling on this box may use it. (y/N): n
 ```
 
-1. **Back up first?** (default **yes**) — copies your config file, the keystore pair, and any non-default JDBC jars to `<drive>:\striim_backups\uninstall_<version>_<timestamp>\`, with a `backup-manifest.txt` listing what was saved. Any backup in `striim_backups\` is offered for restore the next time you run an install on the machine.
+1. **Back up first?** (default **yes**) — copies your config file, the keystore pair, the `log4j*.properties` logging config, and any non-default JDBC jars to `<drive>:\striim_backups\uninstall_<version>_<timestamp>\`, with a `backup-manifest.txt` listing what was saved. Any backup in `striim_backups\` is offered for restore the next time you run an install on the machine.
 2. **Keep the `downloads\` cache?** (default **yes**) — moves it next to the backup folder for a future reinstall.
 3. **Also remove `sqljdbc_auth.dll` from System32?** (default **no**) — other SQL tooling on the machine may use it.
 
@@ -552,7 +552,7 @@ You then see a **scope card** stating exactly what will be removed and what will
 |   - D:\striim\Agent (entire directory)
 |   - D:\striim\Agent\lib entry on the machine PATH
 | Will KEEP:
-|   - Backup of config, keystore, and non-default jars -> C:\striim_backups\uninstall_5.4.0.6_20260616-101500
+|   - Backup of config, keystore, log4j, and non-default jars -> C:\striim_backups\uninstall_5.4.0.6_20260616-101500
 |   - downloads\ cache -> C:\striim_backups\uninstall_5.4.0.6_20260616-101500_downloads
 |   - C:\Windows\System32\sqljdbc_auth.dll (other SQL tooling may use it)
 |   - Shared components: Java 17, VC++ redistributable, MS OLE DB driver (manual removal hints in the summary)

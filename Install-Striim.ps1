@@ -1145,7 +1145,7 @@ function Get-BackupConfigDefaults {
 
 function Select-StriimConfigBackup {
     # Prior uninstall/reinstall/upgrade backups (spec 2.7) seed a new install: cluster settings
-    # become interview defaults; keystore + non-default jars are restored after extraction.
+    # become interview defaults; keystore + log4j config + non-default jars are restored after extraction.
     param([Parameter(Mandatory)][ValidateSet('A', 'N')][string]$NodeType)
     $backups = @(Find-StriimConfigBackups -NodeType $NodeType)
     if ($backups.Count -eq 0) {
@@ -1272,7 +1272,7 @@ function New-InstallPlan {
 
     if ($Mode -in @('Install', 'Reinstall', 'Upgrade')) {
         if ($Backup -and $Backup.DoBackup) {
-            & $add "Back up config, keystore, and non-default jars -> $($Backup.BackupDir)"
+            & $add "Back up config, keystore, log4j, and non-default jars -> $($Backup.BackupDir)"
         }
         if ($Mode -eq 'Upgrade') {
             & $add "Stop + deregister '$($artifacts.ServiceName)' service (the wrapper is version-specific)"
@@ -1292,7 +1292,7 @@ function New-InstallPlan {
         $httpsLabel = if ($Interview.HttpsEnabled) { 'HTTPS' } else { 'HTTP' }
         & $add "Write $($artifacts.ConfigFile) (cluster=$($Interview.ClusterName), server=$($Interview.ServerAddress), $httpsLabel)"
         if ($Interview.RestoreFrom) {
-            $restoreWhat = if ($Interview.RestoreKeystore) { 'keystore + non-default jars' } else { 'non-default jars' }
+            $restoreWhat = if ($Interview.RestoreKeystore) { 'keystore, log4j config, and non-default jars' } else { 'log4j config and non-default jars' }
             & $add "Restore $restoreWhat from $($Interview.RestoreFrom)"
         }
         if (@($Interview.Drivers).Count -gt 0) {
@@ -2001,8 +2001,11 @@ function New-KeystoreStep {
 
 function Get-RestorableBackupFiles {
     # Relative paths a restore copies back: the keystore pair (only while the cluster still
-    # matches - it is bound to its cluster) and every backed-up lib\ jar. The conf file is
+    # matches - it is bound to its cluster), the backed-up log4j*.properties logging config,
+    # and every backed-up lib\ jar. The main conf file (agent.conf/startUp.properties) is
     # NOT copied: the wizard rewrites it from interview answers the backup already prefilled.
+    # log4j IS copied - it has no interview to regenerate from, and is cluster-independent so
+    # it restores regardless of keystore/cluster match.
     param(
         [Parameter(Mandatory)][string]$BackupDir,
         [Parameter(Mandatory)][ValidateSet('A', 'N')][string]$NodeType,
@@ -2015,6 +2018,9 @@ function Get-RestorableBackupFiles {
             if (Test-Path (Join-Path $BackupDir $relative)) { [void]$files.Add($relative) }
         }
     }
+    foreach ($relative in @(Get-Log4jConfigFiles -RootPath $BackupDir)) {
+        [void]$files.Add($relative)
+    }
     foreach ($jar in @(Get-ChildItem -Path (Join-Path $BackupDir 'lib') -Filter '*.jar' -File -ErrorAction SilentlyContinue)) {
         [void]$files.Add("lib\$($jar.Name)")
     }
@@ -2026,7 +2032,7 @@ function New-RestoreBackupStep {
     # so generation is skipped and the agent keeps its cluster identity.
     param([Parameter(Mandatory)][object]$Plan)
     $iv = $Plan.Interview
-    $what = if ($iv.RestoreKeystore) { 'keystore + non-default jars' } else { 'non-default jars' }
+    $what = if ($iv.RestoreKeystore) { 'keystore, log4j config, and non-default jars' } else { 'log4j config and non-default jars' }
     return New-InstallStep -Name "Restore $what from $($iv.RestoreFrom)" -Test {
         $files = @(Get-RestorableBackupFiles -BackupDir $iv.RestoreFrom -NodeType $iv.NodeType -IncludeKeystore $iv.RestoreKeystore)
         @($files | Where-Object { -not (Test-Path (Join-Path $iv.InstallPath $_)) }).Count -eq 0
@@ -2706,7 +2712,7 @@ function New-ConfigBackupChoice {
     if ($Required) {
         Write-Log -Level Info -Message "Config, keystore, and non-default lib\ jars will be backed up to $backupDir first."
     } else {
-        $doBackup = Confirm-UserChoice -Prompt "Back up $($artifacts.ConfigFile | Split-Path -Leaf), the keystore pair, and non-default lib\ jars to $backupDir first?" -DefaultChoice 'y'
+        $doBackup = Confirm-UserChoice -Prompt "Back up $($artifacts.ConfigFile | Split-Path -Leaf), the keystore pair, log4j config, and non-default lib\ jars to $backupDir first?" -DefaultChoice 'y'
     }
     return [pscustomobject]@{
         DoBackup = $doBackup; BackupRoot = $backupRoot; BackupDir = $backupDir
@@ -2732,7 +2738,7 @@ function Invoke-MaintenanceUpgrade {
     # Maintenance [5]: the official upgrade procedure as one plan - settings are read from the
     # live config BEFORE anything is touched, then: mandatory backup -> stop + deregister the old
     # service (the wrapper is version-specific) -> purge -> install the new version -> restore
-    # keystore + non-default jars. Cluster identity is preserved by construction.
+    # keystore + log4j config + non-default jars. Cluster identity is preserved by construction.
     param([Parameter(Mandatory)][object]$Install)
     $interview = ConvertTo-InterviewFromInstall -Install $Install
     $artifacts = Get-ProfileArtifacts -NodeType $Install.Type
@@ -2806,9 +2812,24 @@ function Get-NonDefaultLibJars {
     return @($result)
 }
 
+function Get-Log4jConfigFiles {
+    # Customer-customizable logging config to preserve across uninstall/reinstall/upgrade:
+    # every conf\log4j*.properties (agent: log4j.agent.properties; node: log4j.console/server/
+    # upgrade.properties). The *.distribute shipped templates are EXCLUDED - only live
+    # .properties files are matched. Returns relative paths (conf\<name>) so a live install
+    # (backup source) and a backup dir (restore source) enumerate identically.
+    param([Parameter(Mandatory)][string]$RootPath)
+    $confDir = Join-Path $RootPath 'conf'
+    if (-not (Test-Path $confDir -PathType Container)) { return @() }
+    return @(Get-ChildItem -Path $confDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'log4j*' -and $_.Extension -eq '.properties' } |
+        ForEach-Object { "conf\$($_.Name)" })
+}
+
 function Backup-StriimConfig {
     # Spec 2.7 item 2: pre-removal backup of agent.conf/startUp.properties, the keystore pair
-    # (aks.jks+aksKey.pwd / sks.*, per Get-ProfileArtifacts), and non-default jars in lib\.
+    # (aks.jks+aksKey.pwd / sks.*, per Get-ProfileArtifacts), the log4j*.properties logging
+    # config, and non-default jars in lib\.
     # backup-manifest.txt is written LAST - its presence is the step's completion marker.
     param(
         [Parameter(Mandatory)][string]$InstallPath,
@@ -2827,6 +2848,10 @@ function Backup-StriimConfig {
         } else {
             Write-Log -Level Warn -Message "Backup: $relative not found under $InstallPath - skipped."
         }
+    }
+    foreach ($relative in @(Get-Log4jConfigFiles -RootPath $InstallPath)) {
+        Copy-Item -Path (Join-Path $InstallPath $relative) -Destination (Join-Path $BackupDir $relative) -Force
+        [void]$copied.Add($relative)
     }
     foreach ($jar in @(Get-NonDefaultLibJars -LibPath (Join-Path $InstallPath 'lib'))) {
         Copy-Item -Path $jar.FullName -Destination (Join-Path $BackupDir 'lib') -Force
@@ -2952,7 +2977,7 @@ function New-UninstallStepList {
     $steps = New-Object System.Collections.ArrayList
 
     if ($un.DoBackup) {
-        [void]$steps.Add((New-InstallStep -Name "Back up config, keystore, and non-default jars -> $($un.BackupDir)" -Test {
+        [void]$steps.Add((New-InstallStep -Name "Back up config, keystore, log4j, and non-default jars -> $($un.BackupDir)" -Test {
             Test-Path (Join-Path $un.BackupDir 'backup-manifest.txt')
         }.GetNewClosure() -Action {
             Backup-StriimConfig -InstallPath $iv.InstallPath -NodeType $iv.NodeType -BackupDir $un.BackupDir | Out-Null
@@ -3013,7 +3038,7 @@ function Show-UninstallScopeCard {
     Write-Host ("|   - {0} entry on the machine PATH" -f $libPath)
     if ($un.RemoveAuthDll) { Write-Host '|   - C:\Windows\System32\sqljdbc_auth.dll' }
     Write-Host '| Will KEEP:' -ForegroundColor Green
-    if ($un.DoBackup) { Write-Host ("|   - Backup of config, keystore, and non-default jars -> {0}" -f $un.BackupDir) }
+    if ($un.DoBackup) { Write-Host ("|   - Backup of config, keystore, log4j, and non-default jars -> {0}" -f $un.BackupDir) }
     if ($un.KeepDownloads) { Write-Host ("|   - downloads\ cache -> {0}_downloads" -f $un.BackupDir) }
     if (-not $un.RemoveAuthDll) { Write-Host '|   - C:\Windows\System32\sqljdbc_auth.dll (other SQL tooling may use it)' }
     Write-Host '|   - Shared components: Java 17, VC++ redistributable, MS OLE DB driver (manual removal hints in the summary)'
@@ -3118,7 +3143,7 @@ function Get-ConfigBackupSteps {
     )
     if (-not ($Plan.PSObject.Properties['Backup'] -and $Plan.Backup -and $Plan.Backup.DoBackup)) { return @() }
     $bk = $Plan.Backup
-    return @(New-InstallStep -Name "Back up config, keystore, and non-default jars -> $($bk.BackupDir)" -Critical:$Critical -Test {
+    return @(New-InstallStep -Name "Back up config, keystore, log4j, and non-default jars -> $($bk.BackupDir)" -Critical:$Critical -Test {
         Test-Path (Join-Path $bk.BackupDir 'backup-manifest.txt')
     }.GetNewClosure() -Action {
         Backup-StriimConfig -InstallPath $bk.InstallPath -NodeType $bk.NodeType -BackupDir $bk.BackupDir | Out-Null
