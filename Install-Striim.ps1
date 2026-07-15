@@ -60,17 +60,6 @@ $script:DownloadDir = Join-Path $script:WorkingDir 'downloads'
 $script:TranscriptPath = $null
 $script:WarningsCollected = New-Object System.Collections.ArrayList
 
-# Snapshot the host's built-in functions BEFORE this script defines any of its own. At the entry
-# point we promote everything defined since (i.e. this script's functions) into the global scope.
-# Why: step Test/Action blocks are built with .GetNewClosure(), which binds them to a fresh dynamic
-# module. Command lookup inside such a block falls back to GLOBAL scope only - never the script
-# scope where these functions live - so under Windows PowerShell 5.1 (the host the elevated
-# 'powershell.exe -File' relaunch always uses) a step action like 'Backup-StriimConfig' resolves to
-# nothing and fails as 'not recognized'. pwsh 7 happens to resolve it, which is why dev never saw
-# it. This mirrors the existing '$script: is unreachable inside GetNewClosure blocks' workaround,
-# but for functions instead of variables.
-$script:PreexistingFunctions = @(Get-ChildItem -Path Function:\ | ForEach-Object { $_.Name })
-
 $script:DefaultStriimVersion   = '5.4.0.6'
 $script:MinSupportedVersion    = [version]'5.0'
 $script:Java17EraVersion       = [version]'5.0.6'   # builds below this are the Java-11 era
@@ -555,6 +544,48 @@ function Show-FailureMenu {
     }
 }
 
+$script:ClosureAutomaticNames = $null
+function Get-ClosureCapturedVariables {
+    # Pull the variables a .GetNewClosure() block captured out of its dynamic module so they can be
+    # re-supplied when the block is re-bound to the script scope (see Invoke-StepBlock). Captured
+    # values sit at scope 1 of the module (scope 0 is the transient scope of the probe block); the
+    # automatic variables present in any fresh closure module are computed once and filtered out.
+    param([Parameter(Mandatory)][scriptblock]$Block)
+    $list = New-Object 'System.Collections.Generic.List[System.Management.Automation.PSVariable]'
+    if (-not $Block.Module) { return , $list }
+    if ($null -eq $script:ClosureAutomaticNames) {
+        $script:ClosureAutomaticNames = @(& ({ }.GetNewClosure().Module) { Get-Variable -Scope 1 -ErrorAction SilentlyContinue } | ForEach-Object Name)
+    }
+    foreach ($v in (& $Block.Module { Get-Variable -Scope 1 -ErrorAction SilentlyContinue })) {
+        if ($script:ClosureAutomaticNames -notcontains $v.Name) {
+            $list.Add((New-Object System.Management.Automation.PSVariable($v.Name, $v.Value)))
+        }
+    }
+    return , $list
+}
+
+function Invoke-StepBlock {
+    # Run a step's Test/Action block so that it (and any installer functions it calls, including
+    # nested calls between them) resolves reliably on EVERY PowerShell version. The blocks are built
+    # with .GetNewClosure(), which binds them to an isolated dynamic-module SessionState; under
+    # Windows PowerShell 5.1 that module does not resolve this script's script-scoped functions, so a
+    # step like 'Backup-StriimConfig ...' fails as 'not recognized'. We re-create the block from its
+    # source text (binding it to this script's session state, where all functions live) and re-supply
+    # the closure's captured variables via InvokeWithContext.
+    param([Parameter(Mandatory)][scriptblock]$Block)
+    $rebound = [scriptblock]::Create($Block.ToString())
+    return $rebound.InvokeWithContext($null, (Get-ClosureCapturedVariables -Block $Block))
+}
+
+function Test-StepCondition {
+    # Invoke a step Test block and coerce its output to a single boolean (InvokeWithContext returns a
+    # collection; the block's result is its last output).
+    param([Parameter(Mandatory)]$Step)
+    $out = @(Invoke-StepBlock -Block $Step.Test)
+    if ($out.Count -eq 0) { return $false }
+    return [bool]$out[-1]
+}
+
 function Invoke-StepList {
     # The core loop: Test -> satisfied? skip : run Action -> re-Test -> failure menu.
     # Mode Verify runs all Tests and changes nothing (maintenance [1]).
@@ -570,7 +601,7 @@ function Invoke-StepList {
         $n++
         Write-Log -Level Step -Message ('[{0}/{1}] {2}' -f $n, $total, $step.Name)
         $passed = $false
-        try { $passed = [bool](& $step.Test) } catch { $passed = $false }
+        try { $passed = Test-StepCondition -Step $step } catch { $passed = $false }
 
         if ($Mode -eq 'Verify') {
             $status = if ($passed) { 'Passed' } else { 'Failed' }
@@ -588,11 +619,12 @@ function Invoke-StepList {
         while (-not $done) {
             $err = ''
             try {
-                & $step.Action | Out-Host
-                $passed = [bool](& $step.Test)
+                Invoke-StepBlock -Block $step.Action | Out-Host
+                $passed = Test-StepCondition -Step $step
             } catch {
                 $passed = $false
-                $err = $_.Exception.Message
+                # InvokeWithContext wraps the real error - surface the inner message when present.
+                $err = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
             }
             if ($passed) {
                 Write-Log -Level Success -Message '  Done.'
@@ -3431,18 +3463,9 @@ function Invoke-Main {
     Write-Log -Level Info -Message 'No existing Striim installation detected - starting the install interview.'
     Invoke-FreshInstallFlow
 }
-function Publish-InstallerFunctions {
-    # Copy every function this script defined into the global scope so the .GetNewClosure() step
-    # blocks (whose command lookup falls back to global, not script scope) can resolve them under
-    # Windows PowerShell 5.1. See the $script:PreexistingFunctions note in the Bootstrap region.
-    foreach ($fn in @(Get-ChildItem -Path Function:\ | Where-Object { $script:PreexistingFunctions -notcontains $_.Name })) {
-        Set-Item -Path ('Function:\global:{0}' -f $fn.Name) -Value $fn.ScriptBlock
-    }
-}
 #endregion Main
 
 # ---- entry point ----
-Publish-InstallerFunctions
 if (-not $NoRun) {
     try {
         Invoke-Main
