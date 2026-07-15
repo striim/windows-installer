@@ -37,9 +37,39 @@ try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
 
 $script:ScriptPath  = $PSCommandPath
 $script:ScriptDir   = Split-Path -Parent $PSCommandPath
-$script:DownloadDir = Join-Path $script:ScriptDir 'downloads'
+
+# Runtime artifacts (downloads\, install-plan.json) live beside the script by default - that keeps
+# an offline/air-gapped bundle self-contained. But the script's own directory is not always
+# writable: if it was downloaded into C:\Windows\System32 (the default working dir of an elevated
+# prompt, so 'iwr -OutFile Install-Striim.ps1' lands it there), a later non-admin run cannot write
+# next to it and plan-file save fails with 'Access denied'. Probe for write access and fall back to
+# a per-user writable directory when the script dir is read-only.
+$script:WorkingDir = $script:ScriptDir
+$script:WorkingDirFallback = $false
+try {
+    $probe = Join-Path $script:ScriptDir ('.striim-writetest-{0}.tmp' -f $PID)
+    New-Item -ItemType File -Path $probe -Force -ErrorAction Stop | Out-Null
+    Remove-Item -Path $probe -Force -ErrorAction SilentlyContinue
+} catch {
+    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } elseif ($env:TEMP) { $env:TEMP } else { $script:ScriptDir }
+    $script:WorkingDir = Join-Path $base 'Striim\installer'
+    New-Item -ItemType Directory -Force -Path $script:WorkingDir -ErrorAction SilentlyContinue | Out-Null
+    $script:WorkingDirFallback = $true
+}
+$script:DownloadDir = Join-Path $script:WorkingDir 'downloads'
 $script:TranscriptPath = $null
 $script:WarningsCollected = New-Object System.Collections.ArrayList
+
+# Snapshot the host's built-in functions BEFORE this script defines any of its own. At the entry
+# point we promote everything defined since (i.e. this script's functions) into the global scope.
+# Why: step Test/Action blocks are built with .GetNewClosure(), which binds them to a fresh dynamic
+# module. Command lookup inside such a block falls back to GLOBAL scope only - never the script
+# scope where these functions live - so under Windows PowerShell 5.1 (the host the elevated
+# 'powershell.exe -File' relaunch always uses) a step action like 'Backup-StriimConfig' resolves to
+# nothing and fails as 'not recognized'. pwsh 7 happens to resolve it, which is why dev never saw
+# it. This mirrors the existing '$script: is unreachable inside GetNewClosure blocks' workaround,
+# but for functions instead of variables.
+$script:PreexistingFunctions = @(Get-ChildItem -Path Function:\ | ForEach-Object { $_.Name })
 
 $script:DefaultStriimVersion   = '5.4.0.6'
 $script:MinSupportedVersion    = [version]'5.0'
@@ -3291,7 +3321,10 @@ function Invoke-PlanHandoff {
         Invoke-PlanExecution -Plan $Plan
         return
     }
-    $planPath = Join-Path $script:ScriptDir 'install-plan.json'
+    $planPath = Join-Path $script:WorkingDir 'install-plan.json'
+    if ($script:WorkingDirFallback) {
+        Write-Log -Level Warn -Message "Script directory is not writable ($($script:ScriptDir)); using $($script:WorkingDir) for the plan and downloads."
+    }
     Save-PlanFile -Plan $Plan -Path $planPath
     Write-Log -Level Info -Message 'One UAC prompt follows - the elevated process executes the whole plan unattended.'
     try {
@@ -3349,6 +3382,11 @@ function Invoke-Main {
     # Branch 2: elevated execution phase - no re-asked questions; plan file deleted on completion.
     if ($PlanFile) {
         if (-not (Test-IsAdmin)) { throw 'The -PlanFile execution phase must run elevated (it is launched by the wizard via UAC).' }
+        # Follow the plan file's directory for downloads so the elevated process reuses the working
+        # dir the (possibly non-admin) parent chose - otherwise, when this process re-probes and finds
+        # its own dir writable, downloads would scatter into e.g. C:\Windows\System32\downloads.
+        $script:WorkingDir  = Split-Path -Parent $PlanFile
+        $script:DownloadDir = Join-Path $script:WorkingDir 'downloads'
         $plan = Read-PlanFile -Path $PlanFile
         try {
             Invoke-PlanExecution -Plan $plan
@@ -3360,8 +3398,15 @@ function Invoke-Main {
     }
 
     # Branch 2b: already elevated and a saved plan exists (e.g. prior UAC-blocked attempt).
-    $savedPlanPath = Join-Path $script:ScriptDir 'install-plan.json'
-    if ((Test-IsAdmin) -and (Test-Path $savedPlanPath)) {
+    # A prior (possibly non-admin) run may have saved the plan beside the script or in the per-user
+    # fallback dir - check both so an elevated resume finds it either way.
+    $planCandidates = @(
+        (Join-Path $script:WorkingDir 'install-plan.json'),
+        (Join-Path $script:ScriptDir 'install-plan.json')
+    )
+    if ($env:LOCALAPPDATA) { $planCandidates += (Join-Path $env:LOCALAPPDATA 'Striim\installer\install-plan.json') }
+    $savedPlanPath = $planCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ((Test-IsAdmin) -and $savedPlanPath) {
         Write-Log -Level Info -Message "Found a saved install plan at: $savedPlanPath"
         if (Confirm-UserChoice -Prompt 'Resume from saved plan?' -DefaultChoice 'y') {
             $plan = Read-PlanFile -Path $savedPlanPath
@@ -3386,9 +3431,18 @@ function Invoke-Main {
     Write-Log -Level Info -Message 'No existing Striim installation detected - starting the install interview.'
     Invoke-FreshInstallFlow
 }
+function Publish-InstallerFunctions {
+    # Copy every function this script defined into the global scope so the .GetNewClosure() step
+    # blocks (whose command lookup falls back to global, not script scope) can resolve them under
+    # Windows PowerShell 5.1. See the $script:PreexistingFunctions note in the Bootstrap region.
+    foreach ($fn in @(Get-ChildItem -Path Function:\ | Where-Object { $script:PreexistingFunctions -notcontains $_.Name })) {
+        Set-Item -Path ('Function:\global:{0}' -f $fn.Name) -Value $fn.ScriptBlock
+    }
+}
 #endregion Main
 
 # ---- entry point ----
+Publish-InstallerFunctions
 if (-not $NoRun) {
     try {
         Invoke-Main
