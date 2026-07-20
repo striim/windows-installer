@@ -403,9 +403,17 @@ function Get-RemoteFile {
     if ($curl) {
         Write-Log -Level Info -Message "Downloading $(Split-Path $OutFile -Leaf) via curl.exe..."
         $curlArgs = Get-CurlArguments -Uri $Uri -OutFile $partial
-        & $curl.Source @curlArgs
-        if ($LASTEXITCODE -eq 0) { $ok = $true }
-        else { Write-Log -Level Warn -Message "curl.exe failed (exit $LASTEXITCODE); trying BITS..." }
+        try {
+            & $curl.Source @curlArgs
+            if ($LASTEXITCODE -eq 0) { $ok = $true }
+            else { Write-Log -Level Warn -Message "curl.exe failed (exit $LASTEXITCODE); trying BITS..." }
+        } catch {
+            # Unlike the BITS/HttpClient fallbacks below, a bare '& curl.exe' has no try/catch of
+            # its own - under $ErrorActionPreference = 'Stop' a native-command error here (e.g. a
+            # NativeCommandError surfaced as terminating) would otherwise skip the $LASTEXITCODE
+            # check entirely and abort the whole download instead of falling through to BITS.
+            Write-Log -Level Warn -Message "curl.exe threw an error ($($_.Exception.Message)); trying BITS..."
+        }
     }
 
     # 2) BITS (Server 2016 / curl-less boxes)
