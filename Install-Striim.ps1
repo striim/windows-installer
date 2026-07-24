@@ -1989,6 +1989,14 @@ function New-ConfigStep {
     }.GetNewClosure()
 }
 
+function Get-ServiceWrapperZipPath {
+    # The yajsw wrapper zip (Category 'ServiceInstaller') for this profile/version - shared by
+    # Install-StriimService and Uninstall-StriimWindowsService so both extract the same file.
+    param([Parameter(Mandatory)][object]$Interview)
+    $zipName = if ($Interview.NodeType -eq 'A') { "Striim_windowsAgent_$($Interview.Version).zip" } else { "Striim_windowsService_$($Interview.Version).zip" }
+    return Join-Path $script:DownloadDir $zipName
+}
+
 function Install-StriimService {
     # yajsw setup scripts require the CURRENT LOCATION to be their folder when invoked (field lore).
     # Always deregister any existing registration first (no-op if none) - a stale service left over
@@ -1999,9 +2007,8 @@ function Install-StriimService {
     Uninstall-StriimWindowsService -Plan $Plan
     $iv = $Plan.Interview
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
-    $zipName = if ($iv.NodeType -eq 'A') { "Striim_windowsAgent_$($iv.Version).zip" } else { "Striim_windowsService_$($iv.Version).zip" }
-    $zipPath = Join-Path $script:DownloadDir $zipName
-    if (-not (Test-Path $zipPath)) { throw "$zipName not found in $script:DownloadDir." }
+    $zipPath = Get-ServiceWrapperZipPath -Interview $iv
+    if (-not (Test-Path $zipPath)) { throw "$(Split-Path $zipPath -Leaf) not found in $script:DownloadDir." }
     $serviceConfigDir = Join-Path $iv.InstallPath $artifacts.ServiceConfigDir
     if (Test-Path $serviceConfigDir) { Remove-Item -Path $serviceConfigDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $serviceConfigDir | Out-Null
@@ -3000,6 +3007,20 @@ function Uninstall-StriimWindowsService {
     if (Test-Path $serviceConfigDir) {
         $bat = Get-ChildItem -Path $serviceConfigDir -Recurse -Filter 'uninstallService.bat' -ErrorAction SilentlyContinue |
             Select-Object -First 1
+    }
+    if (-not $bat) {
+        # ServiceConfigDir missing/empty (e.g. a prior attempt registered the service but never
+        # extracted its wrapper) - the SCM's real service name doesn't always match $serviceName
+        # (see Get-StriimServiceCim's DisplayName fallback), so a raw sc.exe delete below can miss
+        # it; re-extract the wrapper so its own uninstallService.bat can find and remove it correctly.
+        $zipPath = Get-ServiceWrapperZipPath -Interview $iv
+        if (Test-Path $zipPath) {
+            if (Test-Path $serviceConfigDir) { Remove-Item -Path $serviceConfigDir -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $serviceConfigDir | Out-Null
+            Expand-StriimArchive -ZipPath $zipPath -Destination $serviceConfigDir -PreserveNames @()
+            $bat = Get-ChildItem -Path $serviceConfigDir -Recurse -Filter 'uninstallService.bat' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
     }
     if ($bat) {
         Push-Location $bat.DirectoryName
