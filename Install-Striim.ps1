@@ -3035,9 +3035,13 @@ function Uninstall-StriimWindowsService {
     } else {
         Write-Log -Level Warn -Message "uninstallService.bat not found under $serviceConfigDir - falling back to sc.exe delete."
     }
-    if ($null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
-        & sc.exe delete "$serviceName" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "sc.exe delete '$serviceName' failed with code $LASTEXITCODE." }
+    $svc = Get-StriimServiceCim -ServiceName $serviceName
+    if ($null -ne $svc) {
+        # sc.exe needs the SCM's real Name, not the DisplayName - they can differ (see
+        # Get-StriimServiceCim), and deleting by the wrong one fails with error 1060 (does not exist)
+        # even though Get-Service just found it by DisplayName.
+        & sc.exe delete "$($svc.Name)" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "sc.exe delete '$($svc.Name)' failed with code $LASTEXITCODE." }
     }
     # SCM removal can lag a beat after delete - poll briefly before declaring success.
     for ($i = 0; $i -lt 10; $i++) {
