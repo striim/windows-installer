@@ -1991,7 +1991,12 @@ function New-ConfigStep {
 
 function Install-StriimService {
     # yajsw setup scripts require the CURRENT LOCATION to be their folder when invoked (field lore).
+    # Always deregister any existing registration first (no-op if none) - a stale service left over
+    # from a prior attempt (e.g. one with no extracted ServiceConfigDir) must not block a fresh
+    # setupWindowsAgent.ps1/setupWindowsService.ps1 run, and yajsw's installer can fail outright if a
+    # service by that name already exists.
     param([Parameter(Mandatory)][object]$Plan)
+    Uninstall-StriimWindowsService -Plan $Plan
     $iv = $Plan.Interview
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
     $zipName = if ($iv.NodeType -eq 'A') { "Striim_windowsAgent_$($iv.Version).zip" } else { "Striim_windowsService_$($iv.Version).zip" }
@@ -2013,10 +2018,15 @@ function Install-StriimService {
 }
 
 function New-ServiceStep {
+    # Test must not trust bare existence: a service registered by a prior, broken attempt (e.g. one
+    # whose ServiceConfigDir was never extracted) still shows up in Get-Service, but its wrapper exe
+    # is missing and it can never start. Confirm the exe the SCM points at is actually on disk too.
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
     return New-InstallStep -Name "Register '$($artifacts.ServiceName)' Windows service" -Test {
-        $null -ne (Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue)
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$($artifacts.ServiceName)'" -ErrorAction SilentlyContinue
+        if ($null -eq $svc) { return $false }
+        Test-Path (ConvertFrom-ServicePathName -PathName $svc.PathName)
     }.GetNewClosure() -Action {
         Install-StriimService -Plan $Plan
     }.GetNewClosure()
