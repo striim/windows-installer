@@ -65,6 +65,12 @@ $script:MinSupportedVersion    = [version]'5.0'
 $script:Java17EraVersion       = [version]'5.0.6'   # builds below this are the Java-11 era
 $script:KnownGoodOleDbVersions = @('18.2.3.0', '18.7.4.0')  # extend as QA'd
 
+# The yajsw service definition embeds the install path roughly eight times. Windows caps a process
+# command line at 32767 chars, but the practical ceiling is far lower once the JVM args, classpath and
+# library paths are added; installs at C:\striim\Agent (15 chars) are safe, and field failures have
+# been seen from profile-relative paths around 45 chars. Warn past this, do not block.
+$script:MaxComfortableInstallPathLength = 40
+
 # Shared exit-code table (field lore from msjetchecker.ps1) - one place, no per-step magic numbers.
 $script:ExitCodeTable = @{
     0    = [pscustomobject]@{ Result = 'Pass';            Message = 'Success';                                              Hint = '' }
@@ -1036,6 +1042,15 @@ function Read-InstallPath {
         if ($NodeType -eq 'N' -and $info.FreeGB -lt 15) {
             Write-Log -Level Warn -Message 'Node installs: 15 GB free is recommended (advisory - not blocking).'
         }
+        # The yajsw service definition repeats the install path ~8 times (wrapper_home, wrapper.config,
+        # working.dir, jna_tmpdir x2, classpath, java.library.path, com.webaction.agent.home). A long
+        # path pushes the generated command line past the Windows limit, and the service then fails to
+        # spawn with 'The filename or extension is too long' in yajsw_agent\log\wrapper.log - while the
+        # agent's own logs stay empty, because the JVM never starts. Warn before that happens.
+        if ($resolved.Length -gt $script:MaxComfortableInstallPathLength) {
+            Write-Log -Level Warn -Message ("Install path is {0} characters. The Windows service definition repeats it several times and can exceed the command-line length limit, leaving a registered service that cannot start ('The filename or extension is too long'). A short path such as {1}\{2} is strongly recommended." -f $resolved.Length, $resolved.Substring(0, 2), (Get-ProfileArtifacts -NodeType $NodeType).DefaultSubPath)
+            if (-not (Confirm-UserChoice -Prompt 'Use this long path anyway?' -DefaultChoice 'n')) { continue }
+        }
         return $resolved
     }
 }
@@ -1948,17 +1963,61 @@ function Write-AgentConfig {
     if (-not [string]::IsNullOrWhiteSpace($iv.MemMin)) { $props['MEM_MIN'] = $iv.MemMin }
     Set-ConfigFileProperties -ConfigPath $configPath -Properties $props
     # Keep wrapper.conf (yajsw service JVM args) in lockstep so the service does not silently override
-    # agent.conf at JVM start. No-op (warn) when wrapper.conf is absent (no service wrapper installed).
-    if (Resolve-WrapperConfPath -InstallPath $iv.InstallPath -NodeType $iv.NodeType) {
-        $fieldByKey = @{ MEM_MAX = $iv.MemMax; MEM_MIN = $iv.MemMin; ClusterName = $iv.ClusterName; ServerAddress = $iv.ServerAddress }
-        foreach ($entry in $script:WrapperPropertyMap) {
-            $val = [string]$fieldByKey[$entry.Key]
-            if ([string]::IsNullOrWhiteSpace($val)) { continue }   # never write a blank arg
-            Set-WrapperProperty -InstallPath $iv.InstallPath -NodeType $iv.NodeType -MapEntry $entry -NewValue $val
-        }
-    } else {
+    # agent.conf at JVM start. On a FRESH install wrapper.conf does not exist yet at this point - it is
+    # created later by the service-registration step - so this is a no-op here and the real sync happens
+    # in New-WrapperSyncStep after registration. See Update-WrapperConfFromInterview.
+    [void](Update-WrapperConfFromInterview -Interview $iv)
+}
+
+function Update-WrapperConfFromInterview {
+    # Write the interview's cluster/heap values into the service wrapper.conf JVM args.
+    # Returns $true when wrapper.conf was found and synced, $false when it is absent.
+    #
+    # Split out of Write-AgentConfig because the ordering matters: the config step runs BEFORE the
+    # service step, and the service step is what creates wrapper.conf. Syncing only from the config
+    # step therefore always skipped on a fresh install, leaving yajsw's generated wrapper.conf with
+    # EMPTY -Dstriim.cluster.clusterName= / -Dstriim.node.servernode.address= args. Because those args
+    # override agent.conf at JVM start, the registered service then started a JVM with nowhere to
+    # connect - silently, since the install itself reported success.
+    param([Parameter(Mandatory)][object]$Interview)
+    if (-not (Resolve-WrapperConfPath -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType)) {
         Write-Log -Level Info -Message 'No wrapper.conf (Windows service wrapper) present - skipped JVM-arg sync; agent.conf is authoritative.'
+        return $false
     }
+    $fieldByKey = @{
+        MEM_MAX       = $Interview.MemMax
+        MEM_MIN       = $Interview.MemMin
+        ClusterName   = $Interview.ClusterName
+        ServerAddress = $Interview.ServerAddress
+    }
+    foreach ($entry in $script:WrapperPropertyMap) {
+        $val = [string]$fieldByKey[$entry.Key]
+        if ([string]::IsNullOrWhiteSpace($val)) { continue }   # never write a blank arg
+        Set-WrapperProperty -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType -MapEntry $entry -NewValue $val
+    }
+    return $true
+}
+
+function Test-WrapperConfInSync {
+    # $true when wrapper.conf is absent (nothing to sync) or every mapped arg already carries the
+    # interview value. A blank arg counts as OUT of sync: a blank -D arg still clobbers agent.conf.
+    param([Parameter(Mandatory)][object]$Interview)
+    if (-not (Resolve-WrapperConfPath -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType)) { return $true }
+    $fieldByKey = @{
+        MEM_MAX       = $Interview.MemMax
+        MEM_MIN       = $Interview.MemMin
+        ClusterName   = $Interview.ClusterName
+        ServerAddress = $Interview.ServerAddress
+    }
+    foreach ($entry in $script:WrapperPropertyMap) {
+        $want = [string]$fieldByKey[$entry.Key]
+        if ([string]::IsNullOrWhiteSpace($want)) { continue }   # we never write these, so never check them
+        $have = Get-WrapperProperty -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType -MapEntry $entry
+        # $null = arg absent entirely (agent.conf wins, no conflict); '' or a different value = out of sync.
+        if ($null -eq $have) { continue }
+        if ($have -ne $want) { return $false }
+    }
+    return $true
 }
 
 function Test-AgentConfigWritten {
@@ -2028,14 +2087,34 @@ function New-ServiceStep {
     # Test must not trust bare existence: a service registered by a prior, broken attempt (e.g. one
     # whose ServiceConfigDir was never extracted) still shows up in Get-Service, but its wrapper exe
     # is missing and it can never start. Confirm the exe the SCM points at is actually on disk too.
+    #
+    # Look the service up with Get-StriimServiceCim, NOT a bare Name='<ServiceName>' filter: yajsw
+    # registers the service under its own internal Name (e.g. 'com.webaction.agent.Agent') and puts
+    # 'Striim Agent' in DisplayName only. A Name-only filter therefore returns nothing even though
+    # registration succeeded, so this step reported failure while the identically-named Verify check
+    # (which uses Get-Service, and does resolve display names) reported PASS in the same run.
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
     return New-InstallStep -Name "Register '$($artifacts.ServiceName)' Windows service" -Test {
-        $svc = Get-CimInstance Win32_Service -Filter "Name='$($artifacts.ServiceName)'" -ErrorAction SilentlyContinue
+        $svc = Get-StriimServiceCim -ServiceName $artifacts.ServiceName
         if ($null -eq $svc) { return $false }
         Test-Path (ConvertFrom-ServicePathName -PathName $svc.PathName)
     }.GetNewClosure() -Action {
         Install-StriimService -Plan $Plan
+    }.GetNewClosure()
+}
+
+function New-WrapperSyncStep {
+    # Runs AFTER New-ServiceStep, because registration is what creates wrapper.conf. Without this the
+    # service starts a JVM with empty -Dstriim.cluster.clusterName= / -Dstriim.node.servernode.address=
+    # args (they override agent.conf), and the agent has nowhere to connect - with no error at install
+    # time. Idempotent: the Test passes once every mapped arg carries the interview value.
+    param([Parameter(Mandatory)][object]$Plan)
+    $iv = $Plan.Interview
+    return New-InstallStep -Name 'Sync service wrapper.conf JVM args with conf settings' -Test {
+        Test-WrapperConfInSync -Interview $iv
+    }.GetNewClosure() -Action {
+        [void](Update-WrapperConfFromInterview -Interview $iv)
     }.GetNewClosure()
 }
 
@@ -2274,7 +2353,12 @@ function Get-InstallSteps {
     if ($iv.RestoreFrom) { [void]$steps.Add((New-RestoreBackupStep -Plan $Plan)) }
     foreach ($s in (Get-JdbcDriverSteps -Plan $Plan)) { [void]$steps.Add($s) }
     foreach ($s in (Get-PatchSteps -TargetVersion $iv.Version -NodeType $iv.NodeType -LibPath (Join-Path $iv.InstallPath 'lib'))) { [void]$steps.Add($s) }
-    if ($iv.InstallService) { [void]$steps.Add((New-ServiceStep -Plan $Plan)) }
+    if ($iv.InstallService) {
+        [void]$steps.Add((New-ServiceStep -Plan $Plan))
+        # Must follow registration: the service step is what creates wrapper.conf, so this is the
+        # first point at which the JVM args can be synced with agent.conf.
+        [void]$steps.Add((New-WrapperSyncStep -Plan $Plan))
+    }
     [void]$steps.Add((New-KeystoreStep -Plan $Plan))   # last: may be interactive if passwords were skipped
     return @($steps)
 }
