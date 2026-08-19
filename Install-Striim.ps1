@@ -759,9 +759,31 @@ function Test-StriimInstallDir {
 
 function ConvertFrom-ServicePathName {
     # Win32_Service.PathName is either "quoted exe" args or unquoted-exe args.
+    #
+    # The extracted token is NOT guaranteed to be a rooted path. When yajsw cannot resolve a java
+    # executable it logs 'no java exe found. check configuration file. -> using default "java"' and
+    # registers the service with a bare 'java.exe ...' command line. Callers that Test-Path the
+    # result would then resolve it against the current directory and get $false for a service that
+    # registered perfectly well - use Resolve-ServiceExePath instead of Test-Path directly.
     param([Parameter(Mandatory)][string]$PathName)
     if ($PathName -match '^"([^"]+)"') { return $Matches[1] }
     return ($PathName -split '\s+')[0]
+}
+
+function Resolve-ServiceExePath {
+    # Returns a full path to the service executable, or $null when it cannot be resolved.
+    # Handles the bare-name case (e.g. 'java.exe') by falling back to PATH lookup, which is how the
+    # SCM itself will resolve it at start time.
+    param([Parameter(Mandatory)][string]$PathName)
+    $exe = ConvertFrom-ServicePathName -PathName $PathName
+    if ([System.IO.Path]::IsPathRooted($exe)) {
+        if (Test-Path -LiteralPath $exe) { return $exe }
+        return $null
+    }
+    $cmd = Get-Command -Name $exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return $null
 }
 
 function Find-InstallRootFromPath {
@@ -1969,6 +1991,58 @@ function Write-AgentConfig {
     [void](Update-WrapperConfFromInterview -Interview $iv)
 }
 
+function Resolve-Jdk17ExePath {
+    # Full path to a java.exe for the service to use. Machine-scope JAVA_HOME first (that is what the
+    # Java 17 MSI sets, and it is what a service running as LocalSystem can actually see), then PATH.
+    # Returns $null when nothing resolves.
+    $javaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
+    if (-not $javaHome) { $javaHome = $env:JAVA_HOME }
+    if ($javaHome) {
+        $exe = Join-Path $javaHome 'bin\java.exe'
+        if (Test-Path -LiteralPath $exe) { return $exe }
+    }
+    $cmd = Get-Command -Name 'java.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+function Set-WrapperJavaCommand {
+    # Point wrapper.java.command at a rooted java.exe.
+    #
+    # yajsw ships this as a bare 'java'. When it cannot resolve one it logs
+    #   'no java exe found. check configuration file. -> using default "java"'
+    # and registers the service with a bare 'java.exe ...' command line. Two consequences:
+    #   1. Win32_Service.PathName has no rooted exe, so existence checks that Test-Path it fail.
+    #   2. More seriously, a service runs without the interactive user's PATH, so a bare 'java' may
+    #      not resolve at all at start time - the service registers and then cannot start.
+    # Writing the full path removes both. No-op (warn) when no JDK can be located.
+    param(
+        [Parameter(Mandatory)][string]$InstallPath,
+        [Parameter(Mandatory)][string]$NodeType
+    )
+    $confPath = Resolve-WrapperConfPath -InstallPath $InstallPath -NodeType $NodeType
+    if (-not $confPath) { return $false }
+    $javaExe = Resolve-Jdk17ExePath
+    if (-not $javaExe) {
+        Write-Log -Level Warn -Message 'Could not resolve a java.exe to pin into wrapper.java.command; the service will fall back to a bare "java" and may not start (services do not inherit your PATH).'
+        return $false
+    }
+    $lines = @(Get-Content -LiteralPath $confPath)
+    $found = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        # Only the live setting, never the commented template lines yajsw ships.
+        if ($lines[$i] -match '^\s*wrapper\.java\.command\s*=') {
+            $lines[$i] = "wrapper.java.command = $javaExe"
+            $found = $true
+        }
+    }
+    if (-not $found) { $lines += "wrapper.java.command = $javaExe" }
+    Set-Content -LiteralPath $confPath -Value $lines -Encoding ASCII
+    Write-Log -Level Info -Message "Pinned wrapper.java.command to $javaExe"
+    return $true
+}
+
 function Update-WrapperConfFromInterview {
     # Write the interview's cluster/heap values into the service wrapper.conf JVM args.
     # Returns $true when wrapper.conf was found and synced, $false when it is absent.
@@ -1995,6 +2069,7 @@ function Update-WrapperConfFromInterview {
         if ([string]::IsNullOrWhiteSpace($val)) { continue }   # never write a blank arg
         Set-WrapperProperty -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType -MapEntry $entry -NewValue $val
     }
+    [void](Set-WrapperJavaCommand -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType)
     return $true
 }
 
@@ -2098,7 +2173,7 @@ function New-ServiceStep {
     return New-InstallStep -Name "Register '$($artifacts.ServiceName)' Windows service" -Test {
         $svc = Get-StriimServiceCim -ServiceName $artifacts.ServiceName
         if ($null -eq $svc) { return $false }
-        Test-Path (ConvertFrom-ServicePathName -PathName $svc.PathName)
+        $null -ne (Resolve-ServiceExePath -PathName $svc.PathName)
     }.GetNewClosure() -Action {
         Install-StriimService -Plan $Plan
     }.GetNewClosure()
