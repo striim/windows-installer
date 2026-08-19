@@ -71,6 +71,13 @@ $script:KnownGoodOleDbVersions = @('18.2.3.0', '18.7.4.0')  # extend as QA'd
 # been seen from profile-relative paths around 45 chars. Warn past this, do not block.
 $script:MaxComfortableInstallPathLength = 40
 
+# sqljdbc_auth.dll is NOT shipped in Striim's lib\ (verified absent on 5.4.0.2A and 5.4.0.6 Agent
+# packages) despite the other SQL Server natives being there. It ships only in Microsoft's JDBC auth
+# package. GitHub release assets are immutable, so this URL either works or 404s - it never silently
+# returns different content. Pinned to the JDBC line Striim supports (12.x; 13.x is unsupported).
+$script:SqljdbcAuthVersion = '12.10.0'
+$script:SqljdbcAuthUrl = "https://github.com/microsoft/mssql-jdbc/releases/download/v$script:SqljdbcAuthVersion/mssql-jdbc_auth.zip"
+
 # Shared exit-code table (field lore from msjetchecker.ps1) - one place, no per-step magic numbers.
 $script:ExitCodeTable = @{
     0    = [pscustomobject]@{ Result = 'Pass';            Message = 'Success';                                              Hint = '' }
@@ -1422,12 +1429,17 @@ function New-InstallPlan {
         [void]$warnings.Add("cluster auth port $($Interview.AuthPort) on $($Interview.ServerAddress) was unreachable from this host")
     }
     if ($Interview.IntegratedSecurity) {
-        $dllPreInstall = @(
-            (Join-Path $script:ScriptDir 'sqljdbc_auth.dll'),
-            (Join-Path $script:DownloadDir 'sqljdbc_auth.dll')
-        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-        if (-not $dllPreInstall) {
-            [void]$warnings.Add("sqljdbc_auth.dll not found next to the script or in downloads\ - the step will also check Striim's lib\ after extraction, but place the DLL next to this script now to be safe")
+        # Acquire this BEFORE the plan is shown. Previously this was only a warning and the step
+        # failed at position 8 - after the agent had been downloaded and extracted - which is a poor
+        # place to discover a missing prerequisite. Note lib\ is deliberately not consulted here:
+        # on a reinstall the clean step wipes it before the auth step runs, so a hit there would be
+        # misleading.
+        if (-not (Test-Path 'C:\Windows\System32\sqljdbc_auth.dll')) {
+            $dllPreInstall = Get-SqljdbcAuthDllSource
+            if (-not $dllPreInstall) { $dllPreInstall = Install-SqljdbcAuthDllFromWeb }
+            if (-not $dllPreInstall) {
+                [void]$warnings.Add((Get-SqljdbcAuthManualInstructions))
+            }
         }
     }
     if ($Probes.OleDb.Present -and -not $Probes.OleDb.KnownGood) {
@@ -1803,17 +1815,87 @@ function Expand-StriimArchive {
     }
 }
 
+function Get-SqljdbcAuthDllSource {
+    # Locate a usable sqljdbc_auth.dll WITHOUT downloading. Returns a path or $null.
+    #
+    # Two naming conventions are accepted. Microsoft distributes this file as
+    # 'mssql-jdbc_auth-<version>.x64.dll' inside mssql-jdbc_auth.zip; the classic name is
+    # 'sqljdbc_auth.dll'. Anyone who downloads it themselves gets the versioned name, so matching
+    # only the classic one made a correctly-obtained driver package fail to satisfy this step.
+    #
+    # Search order matters on a REINSTALL: the clean and extract steps run before the auth step and
+    # wipe everything under the install path except downloads\, so a copy left in lib\ or beside a
+    # script that lives inside the install dir is destroyed before it can be used. downloads\ is the
+    # only location that survives, so it is checked first.
+    param([string]$InstallPath)
+    $dirs = @($script:DownloadDir, $script:ScriptDir)
+    if ($InstallPath) { $dirs += (Join-Path $InstallPath 'lib') }
+    foreach ($dir in $dirs) {
+        if (-not $dir -or -not (Test-Path $dir)) { continue }
+        $exact = Join-Path $dir 'sqljdbc_auth.dll'
+        if (Test-Path $exact) { return $exact }
+        $versioned = Get-ChildItem -Path $dir -Filter 'mssql-jdbc_auth-*.x64.dll' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($versioned) { return $versioned.FullName }
+    }
+    return $null
+}
+
+function Get-SqljdbcAuthManualInstructions {
+    # One message, used by both the plan-time gate and the step failure, so the user is told the
+    # same actionable thing either way. The old error named three directories and no remedy.
+    return @"
+sqljdbc_auth.dll could not be found or downloaded.
+
+It ships only inside Microsoft's JDBC auth package - Striim's own lib\ does not contain it:
+  $script:SqljdbcAuthUrl
+
+Download it, extract x64\mssql-jdbc_auth-*.x64.dll, and place that file in:
+  $script:DownloadDir
+(no rename needed), then re-run this wizard.
+
+Alternatively answer 'n' to Integrated Security if you are using SQL Server authentication.
+"@
+}
+
+function Install-SqljdbcAuthDllFromWeb {
+    # Fetch Microsoft's auth package from the mssql-jdbc GitHub release and extract the x64 DLL into
+    # downloads\. GitHub release assets are immutable, so this URL either works or 404s - it never
+    # silently returns different content. Returns the extracted path, or $null on any failure: a
+    # download problem must degrade to the manual instructions, never abort the install.
+    $dest = Join-Path $script:DownloadDir 'mssql-jdbc_auth.zip'
+    $work = Join-Path $script:DownloadDir 'mssql-jdbc_auth_extract'
+    try {
+        Write-Log -Level Info -Message "Downloading sqljdbc_auth.dll from $script:SqljdbcAuthUrl"
+        Get-RemoteFile -Uri $script:SqljdbcAuthUrl -OutFile $dest
+        if (Test-Path $work) { Remove-Item -Path $work -Recurse -Force }
+        Expand-Archive -Path $dest -DestinationPath $work -Force
+        $dll = Get-ChildItem -Path $work -Recurse -Filter 'mssql-jdbc_auth-*.x64.dll' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $dll) {
+            Write-Log -Level Warn -Message 'Downloaded auth package did not contain an x64 DLL.'
+            return $null
+        }
+        $final = Join-Path $script:DownloadDir 'sqljdbc_auth.dll'
+        Copy-Item -Path $dll.FullName -Destination $final -Force
+        Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
+        return $final
+    } catch {
+        Write-Log -Level Warn -Message "Could not download sqljdbc_auth.dll: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Install-SqljdbcAuthDll {
-    # Striim 5.x ships sqljdbc_auth.dll inside its own lib\ (extracted before this step
-    # runs); a copy beside the script and downloads\ are kept as fallbacks. Never downloaded.
+    # Place the DLL into System32 under the classic name, which is what the JDBC driver loads.
+    # Local copies first, then the download; the download is attempted here as well as at plan time
+    # so that -Retry after a transient network failure can succeed without a full re-run.
     param([Parameter(Mandatory)][string]$InstallPath)
-    $source = @(
-        (Join-Path $InstallPath 'lib\sqljdbc_auth.dll'),
-        (Join-Path $script:ScriptDir 'sqljdbc_auth.dll'),
-        (Join-Path $script:DownloadDir 'sqljdbc_auth.dll')
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $source) { throw "sqljdbc_auth.dll not found in $InstallPath\lib\, next to the script, or in downloads\." }
+    $source = Get-SqljdbcAuthDllSource -InstallPath $InstallPath
+    if (-not $source) { $source = Install-SqljdbcAuthDllFromWeb }
+    if (-not $source) { throw (Get-SqljdbcAuthManualInstructions) }
     Copy-Item -Path $source -Destination 'C:\Windows\System32\sqljdbc_auth.dll' -Force
+    Write-Log -Level Info -Message "Placed sqljdbc_auth.dll into System32 (from $source)"
 }
 
 function Update-PathValue {
@@ -1991,60 +2073,6 @@ function Write-AgentConfig {
     [void](Update-WrapperConfFromInterview -Interview $iv)
 }
 
-function Resolve-Jdk17ExePath {
-    # Full path to a java.exe for the service to use. Machine-scope JAVA_HOME first (that is what the
-    # Java 17 MSI sets, and it is what a service running as LocalSystem can actually see), then PATH.
-    # Returns $null when nothing resolves.
-    $javaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
-    if (-not $javaHome) { $javaHome = $env:JAVA_HOME }
-    if ($javaHome) {
-        $exe = Join-Path $javaHome 'bin\java.exe'
-        if (Test-Path -LiteralPath $exe) { return $exe }
-    }
-    $cmd = Get-Command -Name 'java.exe' -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($cmd) { return $cmd.Source }
-    return $null
-}
-
-function Set-WrapperJavaCommand {
-    # Point wrapper.java.command at a rooted java.exe.
-    #
-    # yajsw ships this as a bare 'java'. When it cannot resolve one it logs
-    #   'no java exe found. check configuration file. -> using default "java"'
-    # and registers the service with a bare 'java.exe ...' command line. Two consequences:
-    #   1. Win32_Service.PathName has no rooted exe, so existence checks that Test-Path it fail.
-    #   2. More seriously, a service runs without the interactive user's PATH, so a bare 'java' may
-    #      not resolve at all at start time - the service registers and then cannot start.
-    # Writing the full path removes both. No-op (warn) when no JDK can be located.
-    param(
-        [Parameter(Mandatory)][string]$InstallPath,
-        [Parameter(Mandatory)][string]$NodeType
-    )
-    $confPath = Resolve-WrapperConfPath -InstallPath $InstallPath -NodeType $NodeType
-    if (-not $confPath) { return $false }
-    $javaExe = Resolve-Jdk17ExePath
-    if (-not $javaExe) {
-        Write-Log -Level Warn -Message 'Could not resolve a java.exe to pin into wrapper.java.command; the service will fall back to a bare "java" and may not start (services do not inherit your PATH).'
-        return $false
-    }
-    $lines = @(Get-Content -LiteralPath $confPath)
-    $found = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        # Only the live setting, never the commented template lines yajsw ships.
-        if ($lines[$i] -match '^\s*wrapper\.java\.command\s*=') {
-            $lines[$i] = "wrapper.java.command = $javaExe"
-            $found = $true
-        }
-    }
-    if (-not $found) { $lines += "wrapper.java.command = $javaExe" }
-    # UTF-8 without BOM, matching Set-WrapperProperty: yajsw/Java read this file and a BOM can
-    # break the first directive.
-    [System.IO.File]::WriteAllLines($confPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Log -Level Info -Message "Pinned wrapper.java.command to $javaExe"
-    return $true
-}
-
 function Update-WrapperConfFromInterview {
     # Write the interview's cluster/heap values into the service wrapper.conf JVM args.
     # Returns $true when wrapper.conf was found and synced, $false when it is absent.
@@ -2071,7 +2099,6 @@ function Update-WrapperConfFromInterview {
         if ([string]::IsNullOrWhiteSpace($val)) { continue }   # never write a blank arg
         Set-WrapperProperty -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType -MapEntry $entry -NewValue $val
     }
-    [void](Set-WrapperJavaCommand -InstallPath $Interview.InstallPath -NodeType $Interview.NodeType)
     return $true
 }
 
