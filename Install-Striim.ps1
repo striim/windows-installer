@@ -2188,21 +2188,29 @@ function Install-StriimService {
 }
 
 function New-ServiceStep {
-    # Test must not trust bare existence: a service registered by a prior, broken attempt (e.g. one
-    # whose ServiceConfigDir was never extracted) still shows up in Get-Service, but its wrapper exe
-    # is missing and it can never start. Confirm the exe the SCM points at is actually on disk too.
+    # Test must not trust bare existence. Three ways a registered service can still be broken:
     #
-    # Look the service up with Get-StriimServiceCim, NOT a bare Name='<ServiceName>' filter: yajsw
-    # registers the service under its own internal Name (e.g. 'com.webaction.agent.Agent') and puts
-    # 'Striim Agent' in DisplayName only. A Name-only filter therefore returns nothing even though
-    # registration succeeded, so this step reported failure while the identically-named Verify check
-    # (which uses Get-Service, and does resolve display names) reported PASS in the same run.
+    # 1. A prior failed attempt left a registration whose wrapper exe was never extracted.
+    # 2. yajsw registers under its own internal Name (e.g. 'com.webaction.agent.Agent') and puts
+    #    'Striim Agent' in DisplayName only, so a bare Name='<ServiceName>' filter finds nothing even
+    #    though registration succeeded - hence Get-StriimServiceCim, which falls back to DisplayName.
+    # 3. On a REINSTALL the clean step deletes conf\windowsAgent (and with it wrapper.conf and the
+    #    yajsw bat files) while the SCM registration survives, because deregistration is not part of
+    #    a reinstall. A Test that only asks 'is a service registered?' then reports 'Already present',
+    #    skips re-running yajsw, and the install completes reporting success with a service pointing
+    #    at a wrapper directory the same run just deleted. The service cannot start, and the wrapper
+    #    sync step skips too, so nothing downstream notices.
+    #
+    # So: confirm the SCM entry, that its exe resolves, AND that yajsw's own wrapper.conf is on disk.
+    # Failing the last check makes this step self-healing on reinstall.
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
+    $iv = $Plan.Interview
     return New-InstallStep -Name "Register '$($artifacts.ServiceName)' Windows service" -Test {
         $svc = Get-StriimServiceCim -ServiceName $artifacts.ServiceName
         if ($null -eq $svc) { return $false }
-        $null -ne (Resolve-ServiceExePath -PathName $svc.PathName)
+        if ($null -eq (Resolve-ServiceExePath -PathName $svc.PathName)) { return $false }
+        $null -ne (Resolve-WrapperConfPath -InstallPath $iv.InstallPath -NodeType $iv.NodeType)
     }.GetNewClosure() -Action {
         Install-StriimService -Plan $Plan
     }.GetNewClosure()
@@ -2476,8 +2484,12 @@ function Get-VerifySteps {
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
     $steps = New-Object System.Collections.ArrayList
     if ($iv.InstallService) {
-        [void]$steps.Add((New-InstallStep -Name "Windows service '$($artifacts.ServiceName)' registered" -Test {
-            $null -ne (Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue)
+        # Bare Get-Service is not enough: a clean reinstall deletes yajsw's wrapper directory while
+        # leaving the SCM registration intact, so this reported PASS on an install whose service
+        # could never start. Check the wrapper is on disk too.
+        [void]$steps.Add((New-InstallStep -Name "Windows service '$($artifacts.ServiceName)' registered and wrapper present" -Test {
+            if ($null -eq (Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue)) { return $false }
+            $null -ne (Resolve-WrapperConfPath -InstallPath $iv.InstallPath -NodeType $iv.NodeType)
         }.GetNewClosure()))
     }
     [void]$steps.Add((New-InstallStep -Name 'Java 17 resolvable (PATH and JAVA_HOME)' -Test {
