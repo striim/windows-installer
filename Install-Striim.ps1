@@ -2038,7 +2038,9 @@ function Set-WrapperJavaCommand {
         }
     }
     if (-not $found) { $lines += "wrapper.java.command = $javaExe" }
-    Set-Content -LiteralPath $confPath -Value $lines -Encoding ASCII
+    # UTF-8 without BOM, matching Set-WrapperProperty: yajsw/Java read this file and a BOM can
+    # break the first directive.
+    [System.IO.File]::WriteAllLines($confPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
     Write-Log -Level Info -Message "Pinned wrapper.java.command to $javaExe"
     return $true
 }
@@ -2621,10 +2623,17 @@ function Set-WrapperProperty {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i].TrimStart().StartsWith('#')) { continue }
         if ($lines[$i] -match '^(?<pre>\s*wrapper\.java\.additional\.(?<n>\d+)\s*)(?<sep>=\s*)(?<arg>.*)$') {
-            $n = [int]$Matches['n']
+            # Capture the groups NOW. $Matches is a single automatic variable and the -match below
+            # overwrites it, so reading $Matches['pre'] after that inner match yields $null and the
+            # rebuilt line loses its 'wrapper.java.additional.N = ' key entirely - leaving a bare
+            # '-Xms256m' that yajsw cannot parse and silently drops.
+            $pre = $Matches['pre']
+            $sep = $Matches['sep']
+            $arg = $Matches['arg']
+            $n   = [int]$Matches['n']
             if ($n -gt $maxIndex) { $maxIndex = $n }
-            if ($Matches['arg'].Trim() -match $MapEntry.Match) {
-                $lines[$i] = "$($Matches['pre'])$($Matches['sep'])$newArg"
+            if ($arg.Trim() -match $MapEntry.Match) {
+                $lines[$i] = "$pre$sep$newArg"
                 $found = $true
                 break
             }
