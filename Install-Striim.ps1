@@ -71,6 +71,13 @@ $script:KnownGoodOleDbVersions = @('18.2.3.0', '18.7.4.0')  # extend as QA'd
 # been seen from profile-relative paths around 45 chars. Warn past this, do not block.
 $script:MaxComfortableInstallPathLength = 40
 
+# sqljdbc_auth.dll is NOT shipped in Striim's lib\ (verified absent on 5.4.0.2A and 5.4.0.6 Agent
+# packages) despite the other SQL Server natives being there. It ships only in Microsoft's JDBC auth
+# package. GitHub release assets are immutable, so this URL either works or 404s - it never silently
+# returns different content. Pinned to the JDBC line Striim supports (12.x; 13.x is unsupported).
+$script:SqljdbcAuthVersion = '12.10.0'
+$script:SqljdbcAuthUrl = "https://github.com/microsoft/mssql-jdbc/releases/download/v$script:SqljdbcAuthVersion/mssql-jdbc_auth.zip"
+
 # Shared exit-code table (field lore from msjetchecker.ps1) - one place, no per-step magic numbers.
 $script:ExitCodeTable = @{
     0    = [pscustomobject]@{ Result = 'Pass';            Message = 'Success';                                              Hint = '' }
@@ -759,9 +766,31 @@ function Test-StriimInstallDir {
 
 function ConvertFrom-ServicePathName {
     # Win32_Service.PathName is either "quoted exe" args or unquoted-exe args.
+    #
+    # The extracted token is NOT guaranteed to be a rooted path. When yajsw cannot resolve a java
+    # executable it logs 'no java exe found. check configuration file. -> using default "java"' and
+    # registers the service with a bare 'java.exe ...' command line. Callers that Test-Path the
+    # result would then resolve it against the current directory and get $false for a service that
+    # registered perfectly well - use Resolve-ServiceExePath instead of Test-Path directly.
     param([Parameter(Mandatory)][string]$PathName)
     if ($PathName -match '^"([^"]+)"') { return $Matches[1] }
     return ($PathName -split '\s+')[0]
+}
+
+function Resolve-ServiceExePath {
+    # Returns a full path to the service executable, or $null when it cannot be resolved.
+    # Handles the bare-name case (e.g. 'java.exe') by falling back to PATH lookup, which is how the
+    # SCM itself will resolve it at start time.
+    param([Parameter(Mandatory)][string]$PathName)
+    $exe = ConvertFrom-ServicePathName -PathName $PathName
+    if ([System.IO.Path]::IsPathRooted($exe)) {
+        if (Test-Path -LiteralPath $exe) { return $exe }
+        return $null
+    }
+    $cmd = Get-Command -Name $exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return $null
 }
 
 function Find-InstallRootFromPath {
@@ -1400,12 +1429,17 @@ function New-InstallPlan {
         [void]$warnings.Add("cluster auth port $($Interview.AuthPort) on $($Interview.ServerAddress) was unreachable from this host")
     }
     if ($Interview.IntegratedSecurity) {
-        $dllPreInstall = @(
-            (Join-Path $script:ScriptDir 'sqljdbc_auth.dll'),
-            (Join-Path $script:DownloadDir 'sqljdbc_auth.dll')
-        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-        if (-not $dllPreInstall) {
-            [void]$warnings.Add("sqljdbc_auth.dll not found next to the script or in downloads\ - the step will also check Striim's lib\ after extraction, but place the DLL next to this script now to be safe")
+        # Acquire this BEFORE the plan is shown. Previously this was only a warning and the step
+        # failed at position 8 - after the agent had been downloaded and extracted - which is a poor
+        # place to discover a missing prerequisite. Note lib\ is deliberately not consulted here:
+        # on a reinstall the clean step wipes it before the auth step runs, so a hit there would be
+        # misleading.
+        if (-not (Test-Path 'C:\Windows\System32\sqljdbc_auth.dll')) {
+            $dllPreInstall = Get-SqljdbcAuthDllSource
+            if (-not $dllPreInstall) { $dllPreInstall = Install-SqljdbcAuthDllFromWeb }
+            if (-not $dllPreInstall) {
+                [void]$warnings.Add((Get-SqljdbcAuthManualInstructions))
+            }
         }
     }
     if ($Probes.OleDb.Present -and -not $Probes.OleDb.KnownGood) {
@@ -1781,17 +1815,87 @@ function Expand-StriimArchive {
     }
 }
 
+function Get-SqljdbcAuthDllSource {
+    # Locate a usable sqljdbc_auth.dll WITHOUT downloading. Returns a path or $null.
+    #
+    # Two naming conventions are accepted. Microsoft distributes this file as
+    # 'mssql-jdbc_auth-<version>.x64.dll' inside mssql-jdbc_auth.zip; the classic name is
+    # 'sqljdbc_auth.dll'. Anyone who downloads it themselves gets the versioned name, so matching
+    # only the classic one made a correctly-obtained driver package fail to satisfy this step.
+    #
+    # Search order matters on a REINSTALL: the clean and extract steps run before the auth step and
+    # wipe everything under the install path except downloads\, so a copy left in lib\ or beside a
+    # script that lives inside the install dir is destroyed before it can be used. downloads\ is the
+    # only location that survives, so it is checked first.
+    param([string]$InstallPath)
+    $dirs = @($script:DownloadDir, $script:ScriptDir)
+    if ($InstallPath) { $dirs += (Join-Path $InstallPath 'lib') }
+    foreach ($dir in $dirs) {
+        if (-not $dir -or -not (Test-Path $dir)) { continue }
+        $exact = Join-Path $dir 'sqljdbc_auth.dll'
+        if (Test-Path $exact) { return $exact }
+        $versioned = Get-ChildItem -Path $dir -Filter 'mssql-jdbc_auth-*.x64.dll' -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1
+        if ($versioned) { return $versioned.FullName }
+    }
+    return $null
+}
+
+function Get-SqljdbcAuthManualInstructions {
+    # One message, used by both the plan-time gate and the step failure, so the user is told the
+    # same actionable thing either way. The old error named three directories and no remedy.
+    return @"
+sqljdbc_auth.dll could not be found or downloaded.
+
+It ships only inside Microsoft's JDBC auth package - Striim's own lib\ does not contain it:
+  $script:SqljdbcAuthUrl
+
+Download it, extract x64\mssql-jdbc_auth-*.x64.dll, and place that file in:
+  $script:DownloadDir
+(no rename needed), then re-run this wizard.
+
+Alternatively answer 'n' to Integrated Security if you are using SQL Server authentication.
+"@
+}
+
+function Install-SqljdbcAuthDllFromWeb {
+    # Fetch Microsoft's auth package from the mssql-jdbc GitHub release and extract the x64 DLL into
+    # downloads\. GitHub release assets are immutable, so this URL either works or 404s - it never
+    # silently returns different content. Returns the extracted path, or $null on any failure: a
+    # download problem must degrade to the manual instructions, never abort the install.
+    $dest = Join-Path $script:DownloadDir 'mssql-jdbc_auth.zip'
+    $work = Join-Path $script:DownloadDir 'mssql-jdbc_auth_extract'
+    try {
+        Write-Log -Level Info -Message "Downloading sqljdbc_auth.dll from $script:SqljdbcAuthUrl"
+        Get-RemoteFile -Uri $script:SqljdbcAuthUrl -OutFile $dest
+        if (Test-Path $work) { Remove-Item -Path $work -Recurse -Force }
+        Expand-Archive -Path $dest -DestinationPath $work -Force
+        $dll = Get-ChildItem -Path $work -Recurse -Filter 'mssql-jdbc_auth-*.x64.dll' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $dll) {
+            Write-Log -Level Warn -Message 'Downloaded auth package did not contain an x64 DLL.'
+            return $null
+        }
+        $final = Join-Path $script:DownloadDir 'sqljdbc_auth.dll'
+        Copy-Item -Path $dll.FullName -Destination $final -Force
+        Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
+        return $final
+    } catch {
+        Write-Log -Level Warn -Message "Could not download sqljdbc_auth.dll: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Install-SqljdbcAuthDll {
-    # Striim 5.x ships sqljdbc_auth.dll inside its own lib\ (extracted before this step
-    # runs); a copy beside the script and downloads\ are kept as fallbacks. Never downloaded.
+    # Place the DLL into System32 under the classic name, which is what the JDBC driver loads.
+    # Local copies first, then the download; the download is attempted here as well as at plan time
+    # so that -Retry after a transient network failure can succeed without a full re-run.
     param([Parameter(Mandatory)][string]$InstallPath)
-    $source = @(
-        (Join-Path $InstallPath 'lib\sqljdbc_auth.dll'),
-        (Join-Path $script:ScriptDir 'sqljdbc_auth.dll'),
-        (Join-Path $script:DownloadDir 'sqljdbc_auth.dll')
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $source) { throw "sqljdbc_auth.dll not found in $InstallPath\lib\, next to the script, or in downloads\." }
+    $source = Get-SqljdbcAuthDllSource -InstallPath $InstallPath
+    if (-not $source) { $source = Install-SqljdbcAuthDllFromWeb }
+    if (-not $source) { throw (Get-SqljdbcAuthManualInstructions) }
     Copy-Item -Path $source -Destination 'C:\Windows\System32\sqljdbc_auth.dll' -Force
+    Write-Log -Level Info -Message "Placed sqljdbc_auth.dll into System32 (from $source)"
 }
 
 function Update-PathValue {
@@ -2084,21 +2188,29 @@ function Install-StriimService {
 }
 
 function New-ServiceStep {
-    # Test must not trust bare existence: a service registered by a prior, broken attempt (e.g. one
-    # whose ServiceConfigDir was never extracted) still shows up in Get-Service, but its wrapper exe
-    # is missing and it can never start. Confirm the exe the SCM points at is actually on disk too.
+    # Test must not trust bare existence. Three ways a registered service can still be broken:
     #
-    # Look the service up with Get-StriimServiceCim, NOT a bare Name='<ServiceName>' filter: yajsw
-    # registers the service under its own internal Name (e.g. 'com.webaction.agent.Agent') and puts
-    # 'Striim Agent' in DisplayName only. A Name-only filter therefore returns nothing even though
-    # registration succeeded, so this step reported failure while the identically-named Verify check
-    # (which uses Get-Service, and does resolve display names) reported PASS in the same run.
+    # 1. A prior failed attempt left a registration whose wrapper exe was never extracted.
+    # 2. yajsw registers under its own internal Name (e.g. 'com.webaction.agent.Agent') and puts
+    #    'Striim Agent' in DisplayName only, so a bare Name='<ServiceName>' filter finds nothing even
+    #    though registration succeeded - hence Get-StriimServiceCim, which falls back to DisplayName.
+    # 3. On a REINSTALL the clean step deletes conf\windowsAgent (and with it wrapper.conf and the
+    #    yajsw bat files) while the SCM registration survives, because deregistration is not part of
+    #    a reinstall. A Test that only asks 'is a service registered?' then reports 'Already present',
+    #    skips re-running yajsw, and the install completes reporting success with a service pointing
+    #    at a wrapper directory the same run just deleted. The service cannot start, and the wrapper
+    #    sync step skips too, so nothing downstream notices.
+    #
+    # So: confirm the SCM entry, that its exe resolves, AND that yajsw's own wrapper.conf is on disk.
+    # Failing the last check makes this step self-healing on reinstall.
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
+    $iv = $Plan.Interview
     return New-InstallStep -Name "Register '$($artifacts.ServiceName)' Windows service" -Test {
         $svc = Get-StriimServiceCim -ServiceName $artifacts.ServiceName
         if ($null -eq $svc) { return $false }
-        Test-Path (ConvertFrom-ServicePathName -PathName $svc.PathName)
+        if ($null -eq (Resolve-ServiceExePath -PathName $svc.PathName)) { return $false }
+        $null -ne (Resolve-WrapperConfPath -InstallPath $iv.InstallPath -NodeType $iv.NodeType)
     }.GetNewClosure() -Action {
         Install-StriimService -Plan $Plan
     }.GetNewClosure()
@@ -2372,8 +2484,12 @@ function Get-VerifySteps {
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
     $steps = New-Object System.Collections.ArrayList
     if ($iv.InstallService) {
-        [void]$steps.Add((New-InstallStep -Name "Windows service '$($artifacts.ServiceName)' registered" -Test {
-            $null -ne (Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue)
+        # Bare Get-Service is not enough: a clean reinstall deletes yajsw's wrapper directory while
+        # leaving the SCM registration intact, so this reported PASS on an install whose service
+        # could never start. Check the wrapper is on disk too.
+        [void]$steps.Add((New-InstallStep -Name "Windows service '$($artifacts.ServiceName)' registered and wrapper present" -Test {
+            if ($null -eq (Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue)) { return $false }
+            $null -ne (Resolve-WrapperConfPath -InstallPath $iv.InstallPath -NodeType $iv.NodeType)
         }.GetNewClosure()))
     }
     [void]$steps.Add((New-InstallStep -Name 'Java 17 resolvable (PATH and JAVA_HOME)' -Test {
@@ -2546,10 +2662,17 @@ function Set-WrapperProperty {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i].TrimStart().StartsWith('#')) { continue }
         if ($lines[$i] -match '^(?<pre>\s*wrapper\.java\.additional\.(?<n>\d+)\s*)(?<sep>=\s*)(?<arg>.*)$') {
-            $n = [int]$Matches['n']
+            # Capture the groups NOW. $Matches is a single automatic variable and the -match below
+            # overwrites it, so reading $Matches['pre'] after that inner match yields $null and the
+            # rebuilt line loses its 'wrapper.java.additional.N = ' key entirely - leaving a bare
+            # '-Xms256m' that yajsw cannot parse and silently drops.
+            $pre = $Matches['pre']
+            $sep = $Matches['sep']
+            $arg = $Matches['arg']
+            $n   = [int]$Matches['n']
             if ($n -gt $maxIndex) { $maxIndex = $n }
-            if ($Matches['arg'].Trim() -match $MapEntry.Match) {
-                $lines[$i] = "$($Matches['pre'])$($Matches['sep'])$newArg"
+            if ($arg.Trim() -match $MapEntry.Match) {
+                $lines[$i] = "$pre$sep$newArg"
                 $found = $true
                 break
             }
