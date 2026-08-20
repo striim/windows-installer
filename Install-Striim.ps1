@@ -535,17 +535,25 @@ function Invoke-DownloadOnly {
 
 #region StepEngine
 function New-InstallStep {
+    # -Deferrable: the Action deliberately does NOT satisfy the Test, because the work cannot be
+    # completed unattended and has been handed back to the user (currently: keystore generation when
+    # no passwords were supplied). Without this the loop re-Tests after the Action, sees the goal
+    # unmet, and drops into the failure menu - so a run that behaved exactly as designed looks like
+    # it failed at the last step. A Deferrable step whose Action completes without throwing is
+    # recorded as Deferred and the run continues.
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][scriptblock]$Test,
         [scriptblock]$Action = { },
-        [switch]$Critical
+        [switch]$Critical,
+        [switch]$Deferrable
     )
     return [pscustomobject]@{
-        Name     = $Name
-        Test     = $Test
-        Action   = $Action
-        Critical = [bool]$Critical
+        Name       = $Name
+        Test       = $Test
+        Action     = $Action
+        Critical   = [bool]$Critical
+        Deferrable = [bool]$Deferrable
     }
 }
 
@@ -645,6 +653,13 @@ function Invoke-StepList {
             $err = ''
             try {
                 Invoke-StepBlock -Block $step.Action | Out-Host
+                if ($step.PSObject.Properties['Deferrable'] -and $step.Deferrable) {
+                    # Action ran cleanly; the goal is intentionally still unmet. Do not re-Test.
+                    Write-Log -Level Warn -Message '  Deferred - see the instructions at the end of this run.'
+                    [void]$results.Add([pscustomobject]@{ Name = $step.Name; Status = 'Deferred'; Detail = '' })
+                    $done = $true
+                    break
+                }
                 $passed = Test-StepCondition -Step $step
             } catch {
                 $passed = $false
@@ -2341,7 +2356,7 @@ function New-KeystoreStep {
             $script:KeystoreDeferred = $true
             Write-Log -Level Info -Message "Keystore generation deferred: $scriptLeaf needs interactive input. The command is printed at the end of this run."
         }
-    }.GetNewClosure()
+    }.GetNewClosure() -Deferrable:(-not $hasPasswords)
 }
 
 function Get-RestorableBackupFiles {
@@ -2582,10 +2597,14 @@ function Get-VerifySteps {
         $null -ne $drive -and $drive.PercentFree -ge 10
     }.GetNewClosure()))
     # The service cannot start without these, so a run that deferred keystore generation must not
-    # report an unqualified all-clear.
-    [void]$steps.Add((New-InstallStep -Name 'Keystore present (aks/sks .jks and .pwd)' -Test {
-        Test-KeystoreFilesExist -Plan $Plan
-    }.GetNewClosure()))
+    # report an unqualified all-clear. But a deliberate deferral is not a failure either - the
+    # summary carries an ACTION REQUIRED block for it - so only assert this when the run was
+    # supposed to create them.
+    if (-not $script:KeystoreDeferred) {
+        [void]$steps.Add((New-InstallStep -Name 'Keystore present (aks/sks .jks and .pwd)' -Test {
+            Test-KeystoreFilesExist -Plan $Plan
+        }.GetNewClosure()))
+    }
     return @($steps)
 }
 
@@ -2603,6 +2622,7 @@ function Show-SummaryCard {
             'AlreadyPresent' { '[OK]  ', 'Green' }
             'Passed'         { '[PASS]', 'Green' }
             'Skipped'        { '[SKIP]', 'Yellow' }
+            'Deferred'       { '[TODO]', 'Yellow' }
             default          { '[FAIL]', 'Red' }
         }
         Write-Host (' {0} {1}' -f $tag, $r.Name) -ForegroundColor $color
