@@ -71,6 +71,10 @@ $script:KnownGoodOleDbVersions = @('18.2.3.0', '18.7.4.0')  # extend as QA'd
 # been seen from profile-relative paths around 45 chars. Warn past this, do not block.
 $script:MaxComfortableInstallPathLength = 40
 
+# Set by New-KeystoreStep when the keystore script could not be run non-interactively (no
+# passwords supplied). Show-InstallSummary turns this into an ACTION REQUIRED block.
+$script:KeystoreDeferred = $false
+
 # sqljdbc_auth.dll is NOT shipped in Striim's lib\ (verified absent on 5.4.0.2A and 5.4.0.6 Agent
 # packages) despite the other SQL Server natives being there. It ships only in Microsoft's JDBC auth
 # package. GitHub release assets are immutable, so this URL either works or 404s - it never silently
@@ -879,13 +883,40 @@ function Find-StriimInstalls {
 }
 
 function Select-StriimInstall {
+    # Always offer a manual path, even when exactly one install was auto-detected.
+    #
+    # Discovery only reaches an install through the SCM (so only if its service is registered), a
+    # fixed candidate path list, a one-level *striim* scan of each drive root, or the current/script
+    # directory. An install at a non-standard path such as C:\Striim-2\Agent is therefore invisible
+    # whenever its service is deregistered - which is exactly the state a half-finished uninstall
+    # leaves behind, and precisely when you most need to point the wizard at it. Without this the
+    # only workaround is to cd into the directory first.
     param([Parameter(Mandatory)][object[]]$Installs)
-    if (@($Installs).Count -eq 1) { return $Installs[0] }
-    return Show-PickList -Title 'Multiple Striim installs found - pick one:' -Items $Installs -DisplayWith {
+    $list = @($Installs)
+    $manual = [pscustomobject]@{ IsManualEntry = $true }
+    $choice = Show-PickList -Title 'Striim installs found - pick one:' -Items (@($list) + @($manual)) -DisplayWith {
         param($i)
+        if ($i.PSObject.Properties['IsManualEntry']) { return 'Enter a path not listed above' }
         $typeName = if ($i.Type -eq 'A') { 'Agent' } else { 'Node' }
         $ver = if ($i.Version) { $i.Version } else { 'unknown version' }
         '{0}  ({1}, {2}, service: {3})' -f $i.Path, $typeName, $ver, $i.ServiceState
+    }
+    if (-not $choice.PSObject.Properties['IsManualEntry']) { return $choice }
+
+    while ($true) {
+        $entered = Read-Host 'Full path to the Striim install (e.g. C:\Striim-2\Agent)'
+        if ([string]::IsNullOrWhiteSpace($entered)) { return $null }
+        $entered = $entered.Trim().Trim('"')
+        $info = Test-StriimInstallDir -Path $entered
+        if ($info.IsInstall) {
+            $artifacts = Get-ProfileArtifacts -NodeType $info.Type
+            $svc = Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue
+            return [pscustomobject]@{
+                Path = $info.Path; Type = $info.Type; Version = $info.Version
+                ServiceState = if ($svc) { [string]$svc.Status } else { 'not registered' }
+            }
+        }
+        Write-Log -Level Warn -Message "$entered does not look like a Striim install (no lib\ with a Platform jar). Try again, or press Enter to go back."
     }
 }
 
@@ -1415,7 +1446,7 @@ function New-InstallPlan {
         if ($Interview.InstallService) { & $add "Register '$($artifacts.ServiceName)' Windows service" }
         $pwNote = if ($Interview.RestoreKeystore) { 'restored from backup - generation will be skipped' }
                   elseif ($Interview.KeystorePassword -and $Interview.SysPassword) { 'passwords provided' }
-                  else { 'interactive at the end' }
+                  else { 'DEFERRED - you will run this yourself after the install' }
         & $add "Generate keystore via $(Split-Path $artifacts.KeystoreScript -Leaf)  ($pwNote)"
     } elseif ($Mode -eq 'Drivers') {
         & $add "Install JDBC drivers: $(@($Interview.Drivers | ForEach-Object { $_.Label }) -join ', ')"
@@ -2268,12 +2299,34 @@ function Test-KeystoreFilesExist {
 }
 
 function New-KeystoreStep {
+    # When passwords were supplied at interview time this runs the keystore script non-interactively
+    # and the install is genuinely complete.
+    #
+    # When they were skipped, the script needs a terminal. Running it here - inside the elevated
+    # child process, as the last step of a plan - produces a confusing flow: the wizard prints
+    # 'One final step needs your input', the batch file emits its own icacls/copy output, and if it
+    # fails the user is dropped into a [R]etry/[S]kip/[A]bort menu with no way to tell whether the
+    # install itself succeeded. It also cannot be answered at all in an unattended run.
+    #
+    # So the step is DEFERRED instead: the install completes cleanly, and Show-InstallSummary prints
+    # the exact command to run. Test still short-circuits when the keystore already exists (e.g.
+    # restored from a backup), in which case nothing is deferred.
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
-    return New-InstallStep -Name "Generate keystore via $(Split-Path $artifacts.KeystoreScript -Leaf)" -Test {
+    $iv = $Plan.Interview
+    $scriptLeaf = Split-Path $artifacts.KeystoreScript -Leaf
+    $hasPasswords = [bool]($iv.KeystorePassword -and $iv.SysPassword)
+    $stepName = if ($hasPasswords) { "Generate keystore via $scriptLeaf" }
+                else { "Keystore via $scriptLeaf (deferred - needs your input after this run)" }
+    return New-InstallStep -Name $stepName -Test {
         Test-KeystoreFilesExist -Plan $Plan
     }.GetNewClosure() -Action {
-        Invoke-KeystoreConfig -Plan $Plan
+        if ($hasPasswords) {
+            Invoke-KeystoreConfig -Plan $Plan
+        } else {
+            $script:KeystoreDeferred = $true
+            Write-Log -Level Info -Message "Keystore generation deferred: $scriptLeaf needs interactive input. The command is printed at the end of this run."
+        }
     }.GetNewClosure()
 }
 
@@ -2514,6 +2567,11 @@ function Get-VerifySteps {
         $drive = Get-DriveTable | Where-Object { $_.Drive -ieq "${letter}:" } | Select-Object -First 1
         $null -ne $drive -and $drive.PercentFree -ge 10
     }.GetNewClosure()))
+    # The service cannot start without these, so a run that deferred keystore generation must not
+    # report an unqualified all-clear.
+    [void]$steps.Add((New-InstallStep -Name 'Keystore present (aks/sks .jks and .pwd)' -Test {
+        Test-KeystoreFilesExist -Plan $Plan
+    }.GetNewClosure()))
     return @($steps)
 }
 
@@ -2557,7 +2615,28 @@ function Show-NextSteps {
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
     Write-Host "`n Next steps:" -ForegroundColor Cyan
-    Write-Host ("  Start the service:   Start-Service '{0}'" -f $artifacts.ServiceName)
+    if ($script:KeystoreDeferred) {
+        $ksArtifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
+        $ksBat = Join-Path $Plan.Interview.InstallPath $ksArtifacts.KeystoreScript
+        Write-Host ''
+        Write-Host '  ACTION REQUIRED - the keystore has not been generated yet.' -ForegroundColor Yellow
+        Write-Host '  You skipped the keystore and sys passwords, so this step needs a terminal.'
+        Write-Host '  The rest of the install completed successfully.'
+        Write-Host ''
+        Write-Host '  Run this now, from an elevated prompt:' -ForegroundColor Yellow
+        Write-Host ("    cd `"{0}`"" -f $Plan.Interview.InstallPath)
+        Write-Host ("    `"{0}`"" -f $ksBat)
+        Write-Host ''
+        Write-Host ("  It will prompt for the keystore password and the cluster 'sys' password, then")
+        Write-Host ("  create {0} and {1}." -f $ksArtifacts.JksFile, $ksArtifacts.PwdFile)
+        Write-Host ("  The service will not start until those files exist.") -ForegroundColor Yellow
+        Write-Host ''
+    }
+    if ($script:KeystoreDeferred) {
+        Write-Host ("  Start the service:   BLOCKED until the keystore exists - run {0} first" -f (Split-Path $artifacts.KeystoreScript -Leaf)) -ForegroundColor Yellow
+    } else {
+        Write-Host ("  Start the service:   Start-Service '{0}'" -f $artifacts.ServiceName)
+    }
     Write-Host ("  Stop the service:    Stop-Service '{0}'" -f $artifacts.ServiceName)
     Write-Host ("  Agent logs:          {0}\logs\" -f $Plan.Interview.InstallPath)
     Write-Host ("  In the Striim console: once started, the agent appears under Monitor > Agents for cluster '{0}'." -f $Plan.Interview.ClusterName)
@@ -3258,6 +3337,20 @@ function Uninstall-StriimWindowsService {
     throw "Service '$serviceName' is still registered after deregistration attempts."
 }
 
+function Test-PathIsInside {
+    # $true when $Candidate is $Parent or sits underneath it. Used to detect the case where the
+    # shell's working directory (or the running script) lives inside a directory we are about to
+    # delete, which Windows blocks with 'because it is in use'.
+    param(
+        [Parameter(Mandatory)][string]$Candidate,
+        [Parameter(Mandatory)][string]$Parent
+    )
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }
+    $c = $Candidate.TrimEnd('\').ToLowerInvariant()
+    $p = $Parent.TrimEnd('\').ToLowerInvariant()
+    return ($c -eq $p) -or $c.StartsWith($p + '\')
+}
+
 function Remove-StriimInstallDirectory {
     # Spec 2.7 item 5: the backup dir lives OUTSIDE the install dir (<drive>:\striim_backups\)
     # so it survives by construction; downloads\ is optionally relocated next to the backup dir
@@ -3276,7 +3369,29 @@ function Remove-StriimInstallDirectory {
             Write-Log -Level Info -Message "downloads\ kept at $dest (reusable for a future install)."
         }
     }
-    Remove-Item -Path $iv.InstallPath -Recurse -Force
+    # Windows will not delete a directory that is any process's working directory, and the most
+    # common holder is this very shell - the user cd'd in before running the wizard. Step out first
+    # rather than failing a Critical step that cannot be skipped.
+    if (Test-PathIsInside -Candidate (Get-Location).Path -Parent $iv.InstallPath) {
+        $escape = [System.IO.Path]::GetPathRoot($iv.InstallPath)
+        Write-Log -Level Info -Message "Current directory is inside $($iv.InstallPath); moving to $escape so the tree can be removed."
+        Set-Location -LiteralPath $escape
+    }
+    try {
+        Remove-Item -Path $iv.InstallPath -Recurse -Force -ErrorAction Stop
+    } catch {
+        # Name the likely holders instead of just re-throwing 'because it is in use'.
+        $holders = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and (Test-PathIsInside -Candidate $_.Path -Parent $iv.InstallPath) } |
+            Select-Object -ExpandProperty Name -Unique)
+        $hint = if ($holders.Count -gt 0) {
+            "These running processes are executing from inside the directory: $($holders -join ', '). Stop them and choose Retry."
+        } else {
+            'Close any shell, editor, or Explorer window open inside the directory and choose Retry.'
+        }
+        throw "$($_.Exception.Message) $hint"
+    }
+    Write-Log -Level Info -Message "Removed $($iv.InstallPath)"
 }
 
 function New-UninstallStepList {
@@ -3346,7 +3461,8 @@ function Show-UninstallScopeCard {
     Write-Host ("| UNINSTALL PLAN - Striim {0} {1} at {2}" -f $artifacts.ProfileName, $iv.Version, $iv.InstallPath) -ForegroundColor White
     Write-Host '| Will REMOVE:' -ForegroundColor Red
     Write-Host ("|   - Windows service '{0}' (stopped, then deregistered)" -f $artifacts.ServiceName)
-    Write-Host ("|   - {0} (entire directory)" -f $iv.InstallPath)
+    Write-Host (
+        "|   - {0} (entire directory: conf\, lib\, bin\, logs\, modules\, downloads\ ...)" -f $iv.InstallPath)
     Write-Host ("|   - {0} entry on the machine PATH" -f $libPath)
     if ($un.RemoveAuthDll) { Write-Host '|   - C:\Windows\System32\sqljdbc_auth.dll' }
     Write-Host '| Will KEEP:' -ForegroundColor Green
@@ -3354,6 +3470,11 @@ function Show-UninstallScopeCard {
     if ($un.KeepDownloads) { Write-Host ("|   - downloads\ cache -> {0}_downloads" -f $un.BackupDir) }
     if (-not $un.RemoveAuthDll) { Write-Host '|   - C:\Windows\System32\sqljdbc_auth.dll (other SQL tooling may use it)' }
     Write-Host '|   - Shared components: Java 17, VC++ redistributable, MS OLE DB driver (manual removal hints in the summary)'
+    if (Test-PathIsInside -Candidate (Get-Location).Path -Parent $iv.InstallPath) {
+        Write-Host '| NOTE:' -ForegroundColor Yellow
+        Write-Host '|   This shell is currently inside the directory being removed. The wizard will'
+        Write-Host '|   step out to the drive root before deleting it.'
+    }
     Write-Host ('+' + ('-' * 72)) -ForegroundColor Cyan
 }
 
@@ -3553,6 +3674,18 @@ function Get-ExecutionSteps {
                     $svc = Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue
                     ($null -ne $svc) -and ($svc.Status -eq 'Running')
                 }.GetNewClosure() -Action {
+                    # Without the keystore the agent starts, fails to authenticate against the
+                    # cluster, and the SCM still reports Running - the service looks healthy while
+                    # being unusable. Refuse rather than produce that state. This is the common
+                    # follow-on from an install where the keystore step was deferred.
+                    $jks = Join-Path $iv.InstallPath $artifacts.JksFile
+                    $pwdFile = Join-Path $iv.InstallPath $artifacts.PwdFile
+                    if (-not ((Test-Path $jks) -and (Test-Path $pwdFile))) {
+                        $ksBat = Join-Path $iv.InstallPath $artifacts.KeystoreScript
+                        throw ("Keystore missing ({0} / {1}). The service would start but could not " +
+                               "authenticate to cluster '{2}'. Generate it first from an elevated prompt:`n    `"{3}`"" -f
+                               $artifacts.JksFile, $artifacts.PwdFile, $iv.ClusterName, $ksBat)
+                    }
                     Start-Service -Name $artifacts.ServiceName
                 }.GetNewClosure()))
             }
@@ -3707,8 +3840,11 @@ function Invoke-Main {
     $installs = @(Find-StriimInstalls)
     if ($installs.Count -gt 0) {
         $install = Select-StriimInstall -Installs $installs
-        Show-MaintenanceMenu -Install $install
-        return
+        # $null when the user chose 'enter a path' and then backed out with an empty line.
+        if ($null -ne $install) {
+            Show-MaintenanceMenu -Install $install
+            return
+        }
     }
     Write-Log -Level Info -Message 'No existing Striim installation detected - starting the install interview.'
     Invoke-FreshInstallFlow
