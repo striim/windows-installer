@@ -916,7 +916,15 @@ function Select-StriimInstall {
                 ServiceState = if ($svc) { [string]$svc.Status } else { 'not registered' }
             }
         }
-        Write-Log -Level Warn -Message "$entered does not look like a Striim install (no lib\ with a Platform jar). Try again, or press Enter to go back."
+        # Someone choosing 'enter a path' wants a location the wizard did not find, and there are
+        # two reasons for that: discovery missed an existing install, or they want to install here.
+        # Rejecting the second case with a warning about Platform jars sends them hunting for the
+        # right menu, so offer it directly.
+        Write-Log -Level Warn -Message "$entered does not contain a Striim install (no lib\ with a Platform jar)."
+        if (Confirm-UserChoice -Prompt "Install a new Striim there instead?" -DefaultChoice 'y') {
+            return [pscustomobject]@{ IsFreshInstallTarget = $true; Path = $entered }
+        }
+        Write-Log -Level Info -Message 'Enter another path, or press Enter to go back.'
     }
 }
 
@@ -1071,9 +1079,14 @@ function Resolve-InstallPathChoice {
 }
 
 function Read-InstallPath {
-    param([Parameter(Mandatory)][ValidateSet('A', 'N')][string]$NodeType)
+    # -SuggestedPath pre-fills the prompt. Used when the user already named a path earlier in the
+    # flow (e.g. typed one at the install picker), so they are not asked for it twice.
+    param(
+        [Parameter(Mandatory)][ValidateSet('A', 'N')][string]$NodeType,
+        [string]$SuggestedPath
+    )
     $artifacts = Get-ProfileArtifacts -NodeType $NodeType
-    $default = Join-Path "$env:SystemDrive\" $artifacts.DefaultSubPath
+    $default = if ($SuggestedPath) { $SuggestedPath } else { Join-Path "$env:SystemDrive\" $artifacts.DefaultSubPath }
     $drives = @(Get-DriveTable)
     Show-DriveTable -Drives $drives
     while ($true) {
@@ -1316,6 +1329,7 @@ function Select-StriimConfigBackup {
 
 function Read-InstallInterview {
     # All user decisions, collected once, in spec 2.2 order. No admin required.
+    param([string]$SuggestedPath)
     Show-SystemSnapshot
     $profile = Show-PickList -Title 'Install profile:' -Items @(
         [pscustomobject]@{ NodeType = 'A'; Label = 'Striim Forwarding Agent (default)' },
@@ -1323,7 +1337,7 @@ function Read-InstallInterview {
     ) -DisplayWith { param($i) $i.Label }
     $nodeType = $profile.NodeType
     $targetVersion = Read-StriimVersion -NodeType $nodeType
-    $installPath = Read-InstallPath -NodeType $nodeType
+    $installPath = Read-InstallPath -NodeType $nodeType -SuggestedPath $SuggestedPath
     $restoreBackup = Select-StriimConfigBackup -NodeType $nodeType
     $backupDefaults = $null
     if ($restoreBackup) { $backupDefaults = Get-BackupConfigDefaults -ConfigPath $restoreBackup.ConfigPath -NodeType $nodeType }
@@ -3761,8 +3775,8 @@ function Invoke-FreshInstallFlow {
     # is detected, or explicitly via maintenance [7] (broken install, second copy, new path).
     # -ExistingInstall: the detected install; choosing its path again switches to a purge-first
     # reinstall plan (with the same pre-removal backup offer as maintenance [4]).
-    param([object]$ExistingInstall = $null)
-    $interview = Read-InstallInterview
+    param([object]$ExistingInstall = $null, [string]$SuggestedPath)
+    $interview = Read-InstallInterview -SuggestedPath $SuggestedPath
     $mode = 'Install'
     $backup = $null
     if ($ExistingInstall -and ($interview.InstallPath.TrimEnd('\') -ieq $ExistingInstall.Path.TrimEnd('\'))) {
@@ -3840,6 +3854,12 @@ function Invoke-Main {
     $installs = @(Find-StriimInstalls)
     if ($installs.Count -gt 0) {
         $install = Select-StriimInstall -Installs $installs
+        # A path the user typed that holds no install: go straight to the fresh-install interview
+        # with it pre-filled, rather than making them find maintenance option 8.
+        if ($null -ne $install -and $install.PSObject.Properties['IsFreshInstallTarget']) {
+            Invoke-FreshInstallFlow -SuggestedPath $install.Path
+            return
+        }
         # $null when the user chose 'enter a path' and then backed out with an empty line.
         if ($null -ne $install) {
             Show-MaintenanceMenu -Install $install
