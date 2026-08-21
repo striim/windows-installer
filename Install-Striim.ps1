@@ -2312,7 +2312,24 @@ function Invoke-KeystoreConfig {
             $ksPlain = ConvertTo-PlainText -Secure $iv.KeystorePassword
             $sysPlain = ConvertTo-PlainText -Secure $iv.SysPassword
             try {
-                & cmd.exe /c "`"$batPath`" `"$ksPlain`" `"$sysPlain`""
+                # Argument convention differs between agent packages. Newer aksConfig.bat expects
+                # flags and rejects bare values:
+                #   Usage: "aksConfig.bat" [-p USER_PASSWORD] [-k KEYSTORE_PASSWORD]
+                # Passing them positionally there fails with 'Invalid Option: "<first value>"' and
+                # no keystore is produced. Older builds take them positionally. Read the script's
+                # own usage text rather than guessing - it is a few KB and this runs once.
+                $usesFlags = $false
+                try {
+                    $batText = Get-Content -LiteralPath $batPath -Raw -ErrorAction Stop
+                    $usesFlags = ($batText -match 'USER_PASSWORD') -or ($batText -match '\s-k\s')
+                } catch {
+                    Write-Log -Level Warn -Message "Could not read $batPath to determine its argument style; assuming positional."
+                }
+                if ($usesFlags) {
+                    & cmd.exe /c "`"$batPath`" -k `"$ksPlain`" -p `"$sysPlain`""
+                } else {
+                    & cmd.exe /c "`"$batPath`" `"$ksPlain`" `"$sysPlain`""
+                }
             } finally {
                 $ksPlain = $null; $sysPlain = $null
             }
