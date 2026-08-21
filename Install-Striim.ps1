@@ -1459,6 +1459,7 @@ function New-InstallPlan {
             & $add "Stop + deregister '$($artifacts.ServiceName)' service (the wrapper is version-specific)"
         }
         if ($Mode -in @('Reinstall', 'Upgrade')) {
+            & $add "Stop '$($artifacts.ServiceName)' service before cleaning"
             & $add "Clean existing files under $($Interview.InstallPath) (preserving downloads\ and scripts)"
         }
         & $add "Download $mainZip  ($cachedNote)"
@@ -1467,8 +1468,11 @@ function New-InstallPlan {
         if ($needs.VcRedist) { & $add 'Install Visual C++ 2015-2019 Redistributable x64 14.29 (MSJet requires the 2015-2019 line)  (missing)' }
         if ($needs.OleDb) { & $add 'Install Microsoft OLE DB Driver for SQL Server  (missing)' }
         else { & $add "Verify MS OLE DB Driver $($Probes.OleDb.Version)  (present)" }
+        # NOTE: this list is hand-maintained and must mirror Get-InstallSteps. It drifted once
+        # already - the keystore was reordered in the executor but still displayed last here, so the
+        # plan card described an order the run did not follow.
         & $add "Extract $($artifacts.ProfileName) -> $($Interview.InstallPath)"
-        if ($Interview.IntegratedSecurity) { & $add "Place sqljdbc_auth.dll into C:\Windows\System32 (from Striim's lib\)" }
+        if ($Interview.IntegratedSecurity) { & $add "Place sqljdbc_auth.dll into C:\Windows\System32" }
         & $add "Add $($Interview.InstallPath)\lib to the system PATH"
         $httpsLabel = if ($Interview.HttpsEnabled) { 'HTTPS' } else { 'HTTP' }
         & $add "Write $($artifacts.ConfigFile) (cluster=$($Interview.ClusterName), server=$($Interview.ServerAddress), $httpsLabel)"
@@ -1476,14 +1480,17 @@ function New-InstallPlan {
             $restoreWhat = if ($Interview.RestoreKeystore) { 'keystore, log4j config, and non-default jars' } else { 'log4j config and non-default jars' }
             & $add "Restore $restoreWhat from $($Interview.RestoreFrom)"
         }
-        if (@($Interview.Drivers).Count -gt 0) {
-            & $add "Install JDBC drivers: $(@($Interview.Drivers | ForEach-Object { $_.Label }) -join ', ')"
-        }
-        if ($Interview.InstallService) { & $add "Register '$($artifacts.ServiceName)' Windows service" }
         $pwNote = if ($Interview.RestoreKeystore) { 'restored from backup - generation will be skipped' }
                   elseif ($Interview.KeystorePassword -and $Interview.SysPassword) { 'passwords provided' }
                   else { 'DEFERRED - you will run this yourself after the install' }
         & $add "Generate keystore via $(Split-Path $artifacts.KeystoreScript -Leaf)  ($pwNote)"
+        if (@($Interview.Drivers).Count -gt 0) {
+            & $add "Install JDBC drivers: $(@($Interview.Drivers | ForEach-Object { $_.Label }) -join ', ')"
+        }
+        if ($Interview.InstallService) {
+            & $add "Register '$($artifacts.ServiceName)' Windows service"
+            & $add 'Sync service wrapper.conf JVM args with conf settings'
+        }
     } elseif ($Mode -eq 'Drivers') {
         & $add "Install JDBC drivers: $(@($Interview.Drivers | ForEach-Object { $_.Label }) -join ', ')"
         & $add "Restart '$($artifacts.ServiceName)' service if registered"
@@ -2306,6 +2313,27 @@ function Invoke-KeystoreConfig {
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
     $batPath = Join-Path $iv.InstallPath $artifacts.KeystoreScript
     if (-not (Test-Path $batPath)) { throw "Keystore script not found: $batPath" }
+    # GenerateAgentConfig (invoked by the keystore script) reads striim.node.servernode.address from
+    # agent.conf and builds https://<value>:<port>/security/nodeAuth WITHOUT splitting on commas.
+    # agent.conf legitimately holds a comma-separated list for a multi-server cluster - the agent
+    # runtime parses it correctly - but here it produces a malformed hostname:
+    #   https://10.0.0.1,10.0.0.2:9081/...  ->  UnknownHostException
+    # Reducing the value to its first entry for the duration of the call fixes it; any one reachable
+    # cluster member can authenticate 'sys'. Leaving the value EMPTY is not an option either: that
+    # falls back to https://localhost:9081 and is refused. Both behaviours verified on a two-node
+    # cluster. Restored in the finally below so the agent keeps its full failover list.
+    $confPath = Join-Path $iv.InstallPath $artifacts.ConfigFile
+    $addrProperty = 'striim.node.servernode.address'
+    $originalConfLines = $null
+    if ((Test-Path $confPath) -and $iv.ServerAddress -and $iv.ServerAddress -match ',') {
+        $firstAddr = ($iv.ServerAddress -split ',')[0].Trim()
+        $originalConfLines = @(Get-Content -LiteralPath $confPath)
+        $temp = $originalConfLines | ForEach-Object {
+            if ($_ -match "^\s*$([regex]::Escape($addrProperty))\s*=") { "$addrProperty=$firstAddr" } else { $_ }
+        }
+        Set-Content -LiteralPath $confPath -Value $temp -Encoding ASCII
+        Write-Log -Level Info -Message "Temporarily set $addrProperty to $firstAddr for keystore generation (the script cannot parse a comma-separated list); the full list is restored afterwards."
+    }
     Push-Location $iv.InstallPath
     try {
         if ($iv.KeystorePassword -and $iv.SysPassword) {
@@ -2333,6 +2361,10 @@ function Invoke-KeystoreConfig {
         if ($LASTEXITCODE -ne 0) { throw "Keystore script exited with code $LASTEXITCODE." }
     } finally {
         Pop-Location
+        if ($null -ne $originalConfLines) {
+            Set-Content -LiteralPath $confPath -Value $originalConfLines -Encoding ASCII
+            Write-Log -Level Info -Message "Restored $addrProperty to $($iv.ServerAddress)."
+        }
     }
 }
 
@@ -2561,18 +2593,17 @@ function Get-InstallSteps {
     [void]$steps.Add((New-ScriptCopyStep -Plan $Plan))
     if ($iv.IntegratedSecurity) { [void]$steps.Add((New-AuthDllStep -Plan $Plan)) }
     [void]$steps.Add((New-PathStep -Plan $Plan))
-    # Keystore BEFORE config, per Striim's documented order (unzip -> aksConfig -> drivers -> edit
-    # agent.conf). It is not cosmetic: aksConfig calls GenerateAgentConfig, which reads
-    # servernode.address out of agent.conf and builds a validation URL from it WITHOUT splitting on
-    # commas. agent.conf legitimately holds a comma-separated list for multi-server clusters, so
-    # running the keystore step after the config step produced
-    #   https://10.0.0.1,10.0.0.2:9081/security/nodeAuth  ->  UnknownHostException
-    # and no keystore. Running first means the address is not yet written and the call succeeds.
-    # Restore first: it brings back the keystore pair (but not agent.conf), which makes the keystore
-    # step's Test pass so generation is correctly skipped for a restored agent.
-    if ($iv.RestoreFrom) { [void]$steps.Add((New-RestoreBackupStep -Plan $Plan)) }
-    [void]$steps.Add((New-KeystoreStep -Plan $Plan))
     [void]$steps.Add((New-ConfigStep -Plan $Plan))
+    # Restore before the keystore step: it brings back the keystore pair (but not agent.conf), which
+    # makes that step's Test pass so generation is correctly skipped for a restored agent.
+    if ($iv.RestoreFrom) { [void]$steps.Add((New-RestoreBackupStep -Plan $Plan)) }
+    # Keystore AFTER config, and after restore. aksConfig -> GenerateAgentConfig reads
+    # servernode.address out of agent.conf to build its validation URL, so the address must already
+    # be written (an empty value falls back to https://localhost:9081 and is refused). It also does
+    # not split the value on commas, so Invoke-KeystoreConfig temporarily reduces a multi-server
+    # list to its first entry for the duration of the call. Both constraints verified on a
+    # two-node cluster.
+    [void]$steps.Add((New-KeystoreStep -Plan $Plan))
     foreach ($s in (Get-JdbcDriverSteps -Plan $Plan)) { [void]$steps.Add($s) }
     foreach ($s in (Get-PatchSteps -TargetVersion $iv.Version -NodeType $iv.NodeType -LibPath (Join-Path $iv.InstallPath 'lib'))) { [void]$steps.Add($s) }
     if ($iv.InstallService) {
@@ -2980,12 +3011,33 @@ function Read-SettingsInterview {
 function Clear-InstallDirectory {
     # Clean-reinstall clearing ALWAYS preserves downloads\, logs\, and the script files themselves (field lore).
     param([Parameter(Mandatory)][string]$Path)
+    # Windows will not delete a directory that is any process's working directory, and the usual
+    # holder is the shell the wizard was launched from - the user cd'd into the install before
+    # running it. This step is Critical and cannot be skipped, so step out rather than abort.
+    if (Test-PathIsInside -Candidate (Get-Location).Path -Parent $Path) {
+        $escape = [System.IO.Path]::GetPathRoot($Path)
+        Write-Log -Level Info -Message "Current directory is inside $Path; moving to $escape so it can be cleaned."
+        Set-Location -LiteralPath $escape
+    }
     $preserveDirs = @('downloads', 'logs')
     $preserveFiles = @((Split-Path $script:ScriptPath -Leaf), 'msjetchecker.ps1', 'install-plan.json')
-    Get-ChildItem -Path $Path -Force | Where-Object {
-        if ($_.PSIsContainer) { $preserveDirs -notcontains $_.Name }
-        else { $preserveFiles -notcontains $_.Name }
-    } | Remove-Item -Recurse -Force
+    try {
+        Get-ChildItem -Path $Path -Force | Where-Object {
+            if ($_.PSIsContainer) { $preserveDirs -notcontains $_.Name }
+            else { $preserveFiles -notcontains $_.Name }
+        } | Remove-Item -Recurse -Force -ErrorAction Stop
+    } catch {
+        # 'used by another process' on its own gives the user nothing to act on - name the holders.
+        $holders = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and (Test-PathIsInside -Candidate $_.Path -Parent $Path) } |
+            Select-Object -ExpandProperty Name -Unique)
+        $hint = if ($holders.Count -gt 0) {
+            "These processes are running from inside the directory: $($holders -join ', '). Stop them (a foreground agent.bat is the usual culprit) and choose Retry."
+        } else {
+            'Close any shell, editor, or Explorer window open inside the directory and choose Retry.'
+        }
+        throw "$($_.Exception.Message) $hint"
+    }
 }
 
 function ConvertTo-InterviewFromInstall {
@@ -3679,6 +3731,16 @@ function Get-ExecutionSteps {
         'Reinstall' {
             $steps = New-Object System.Collections.ArrayList
             foreach ($s in (Get-ConfigBackupSteps -Plan $Plan)) { [void]$steps.Add($s) }
+            # Stop the service before cleaning. A running agent holds bin\ and lib\ open, so the
+            # clean step - which is Critical and cannot be skipped - fails with 'used by another
+            # process' and aborts the whole reinstall. The Upgrade path already does this; Reinstall
+            # did not, so reinstalling over a running agent could never succeed.
+            [void]$steps.Add((New-InstallStep -Name "Stop '$($artifacts.ServiceName)' service before cleaning" -Test {
+                $svc = Get-Service -Name $artifacts.ServiceName -ErrorAction SilentlyContinue
+                ($null -eq $svc) -or ($svc.Status -eq 'Stopped')
+            }.GetNewClosure() -Action {
+                Stop-StriimServiceForce -ServiceName $artifacts.ServiceName -InstallPath $iv.InstallPath
+            }.GetNewClosure()))
             [void]$steps.Add((New-InstallStep -Name "Clean $($iv.InstallPath) (preserving downloads\ and scripts)" -Critical -Test {
                 -not (Test-StriimInstallDir -Path $iv.InstallPath).IsInstall
             }.GetNewClosure() -Action {
