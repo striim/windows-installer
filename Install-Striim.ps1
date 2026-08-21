@@ -2312,24 +2312,17 @@ function Invoke-KeystoreConfig {
             $ksPlain = ConvertTo-PlainText -Secure $iv.KeystorePassword
             $sysPlain = ConvertTo-PlainText -Secure $iv.SysPassword
             try {
-                # Argument convention differs between agent packages. Newer aksConfig.bat expects
-                # flags and rejects bare values:
+                # aksConfig.bat takes flagged arguments only - its :PROCESSARGS loop reads
+                # option/value pairs and rejects anything that is not -h/-?/-p/-k:
                 #   Usage: "aksConfig.bat" [-p USER_PASSWORD] [-k KEYSTORE_PASSWORD]
-                # Passing them positionally there fails with 'Invalid Option: "<first value>"' and
-                # no keystore is produced. Older builds take them positionally. Read the script's
-                # own usage text rather than guessing - it is a few KB and this runs once.
-                $usesFlags = $false
-                try {
-                    $batText = Get-Content -LiteralPath $batPath -Raw -ErrorAction Stop
-                    $usesFlags = ($batText -match 'USER_PASSWORD') -or ($batText -match '\s-k\s')
-                } catch {
-                    Write-Log -Level Warn -Message "Could not read $batPath to determine its argument style; assuming positional."
-                }
-                if ($usesFlags) {
-                    & cmd.exe /c "`"$batPath`" -k `"$ksPlain`" -p `"$sysPlain`""
-                } else {
-                    & cmd.exe /c "`"$batPath`" `"$ksPlain`" `"$sysPlain`""
-                }
+                # Passing the passwords positionally printed 'Invalid Option: "<first value>"',
+                # jumped to :Usage, and never invoked GenerateAgentConfig at all - so no keystore
+                # was produced and the step failed with no useful message.
+                #
+                # The flags also set COMMAND_LINE_ARGS_PASSED, which the script forwards as
+                # -Dstriim.cluster.argsPassed; that is what selects non-interactive mode. Positional
+                # args therefore could never have worked, regardless of parsing.
+                & cmd.exe /c "`"$batPath`" -k `"$ksPlain`" -p `"$sysPlain`""
             } finally {
                 $ksPlain = $null; $sysPlain = $null
             }
@@ -2412,8 +2405,9 @@ function Get-RestorableBackupFiles {
 }
 
 function New-RestoreBackupStep {
-    # Runs after the config write; a restored keystore makes New-KeystoreStep's Test pass,
-    # so generation is skipped and the agent keeps its cluster identity.
+    # Runs before New-KeystoreStep: a restored keystore makes that step's Test pass, so generation
+    # is skipped and the agent keeps its cluster identity. Restores the keystore pair, log4j config
+    # and non-default jars - NOT agent.conf, which the config step writes from the interview.
     param([Parameter(Mandatory)][object]$Plan)
     $iv = $Plan.Interview
     $what = if ($iv.RestoreKeystore) { 'keystore, log4j config, and non-default jars' } else { 'log4j config and non-default jars' }
@@ -2567,8 +2561,18 @@ function Get-InstallSteps {
     [void]$steps.Add((New-ScriptCopyStep -Plan $Plan))
     if ($iv.IntegratedSecurity) { [void]$steps.Add((New-AuthDllStep -Plan $Plan)) }
     [void]$steps.Add((New-PathStep -Plan $Plan))
-    [void]$steps.Add((New-ConfigStep -Plan $Plan))
+    # Keystore BEFORE config, per Striim's documented order (unzip -> aksConfig -> drivers -> edit
+    # agent.conf). It is not cosmetic: aksConfig calls GenerateAgentConfig, which reads
+    # servernode.address out of agent.conf and builds a validation URL from it WITHOUT splitting on
+    # commas. agent.conf legitimately holds a comma-separated list for multi-server clusters, so
+    # running the keystore step after the config step produced
+    #   https://10.0.0.1,10.0.0.2:9081/security/nodeAuth  ->  UnknownHostException
+    # and no keystore. Running first means the address is not yet written and the call succeeds.
+    # Restore first: it brings back the keystore pair (but not agent.conf), which makes the keystore
+    # step's Test pass so generation is correctly skipped for a restored agent.
     if ($iv.RestoreFrom) { [void]$steps.Add((New-RestoreBackupStep -Plan $Plan)) }
+    [void]$steps.Add((New-KeystoreStep -Plan $Plan))
+    [void]$steps.Add((New-ConfigStep -Plan $Plan))
     foreach ($s in (Get-JdbcDriverSteps -Plan $Plan)) { [void]$steps.Add($s) }
     foreach ($s in (Get-PatchSteps -TargetVersion $iv.Version -NodeType $iv.NodeType -LibPath (Join-Path $iv.InstallPath 'lib'))) { [void]$steps.Add($s) }
     if ($iv.InstallService) {
@@ -2577,7 +2581,6 @@ function Get-InstallSteps {
         # first point at which the JVM args can be synced with agent.conf.
         [void]$steps.Add((New-WrapperSyncStep -Plan $Plan))
     }
-    [void]$steps.Add((New-KeystoreStep -Plan $Plan))   # last: may be interactive if passwords were skipped
     return @($steps)
 }
 #endregion ExecuteSteps
@@ -2673,13 +2676,21 @@ function Show-NextSteps {
     param([Parameter(Mandatory)][object]$Plan)
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
     Write-Host "`n Next steps:" -ForegroundColor Cyan
-    if ($script:KeystoreDeferred) {
-        $ksArtifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
+    # Key off the filesystem, not the deferral flag: the keystore is equally absent when the step
+    # was DEFERRED (no passwords given) and when it FAILED and was skipped. The latter used to print
+    # no instructions at all and then told the user to start a service that cannot start.
+    $ksArtifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
+    $ksMissing = -not (Test-KeystoreFilesExist -Plan $Plan)
+    if ($ksMissing) {
         $ksBat = Join-Path $Plan.Interview.InstallPath $ksArtifacts.KeystoreScript
         Write-Host ''
         Write-Host '  ACTION REQUIRED - the keystore has not been generated yet.' -ForegroundColor Yellow
-        Write-Host '  You skipped the keystore and sys passwords, so this step needs a terminal.'
-        Write-Host '  The rest of the install completed successfully.'
+        if ($script:KeystoreDeferred) {
+            Write-Host '  You skipped the keystore and sys passwords, so this step needs a terminal.'
+        } else {
+            Write-Host '  The keystore step did not complete.'
+        }
+        Write-Host '  Everything else in this run finished - generate the keystore and you are done.'
         Write-Host ''
         Write-Host '  Run this now, from an elevated prompt:' -ForegroundColor Yellow
         Write-Host ("    cd `"{0}`"" -f $Plan.Interview.InstallPath)
@@ -2688,9 +2699,20 @@ function Show-NextSteps {
         Write-Host ("  It will prompt for the keystore password and the cluster 'sys' password, then")
         Write-Host ("  create {0} and {1}." -f $ksArtifacts.JksFile, $ksArtifacts.PwdFile)
         Write-Host ("  The service will not start until those files exist.") -ForegroundColor Yellow
+        if ($Plan.Interview.ServerAddress -and $Plan.Interview.ServerAddress -match ',') {
+            $firstAddr = ($Plan.Interview.ServerAddress -split ',')[0].Trim()
+            Write-Host ''
+            Write-Host '  NOTE - your cluster has more than one server address.' -ForegroundColor Yellow
+            Write-Host '  This script reads servernode.address from agent.conf and does not split on'
+            Write-Host '  commas, so it will fail with UnknownHostException. Before running it, set'
+            Write-Host ("  that property to a single address in {0}\conf\agent.conf:" -f $Plan.Interview.InstallPath)
+            Write-Host ("    striim.node.servernode.address={0}" -f $firstAddr)
+            Write-Host ("  then restore the full list afterwards:")
+            Write-Host ("    striim.node.servernode.address={0}" -f $Plan.Interview.ServerAddress)
+        }
         Write-Host ''
     }
-    if ($script:KeystoreDeferred) {
+    if ($ksMissing) {
         Write-Host ("  Start the service:   BLOCKED until the keystore exists - run {0} first" -f (Split-Path $artifacts.KeystoreScript -Leaf)) -ForegroundColor Yellow
     } else {
         Write-Host ("  Start the service:   Start-Service '{0}'" -f $artifacts.ServiceName)
