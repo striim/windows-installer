@@ -1379,7 +1379,7 @@ function Read-InstallInterview {
         $nodeLicense = Read-NodeLicenseSettings -Defaults $licenseDefaults
     }
     $memMaxDefault = if ($backupDefaults) { [string]$backupDefaults.MemMax } else { '' }
-    $memMax = (Read-PromptWithDefault -Prompt 'MEM_MAX tuning value (e.g. 2048m; Enter to skip)' -Default $memMaxDefault).Trim()
+    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX tuning value (e.g. 2048m or 4g; Enter to skip)' -Default $memMaxDefault
     $memMin = if ($backupDefaults) { [string]$backupDefaults.MemMin } else { '' }
     $integratedSecurity = Confirm-UserChoice -Prompt 'Use SQL Server Integrated Security (NT auth, places sqljdbc_auth.dll in System32)?' -DefaultChoice 'n'
     $drivers = @()
@@ -2904,6 +2904,36 @@ function ConvertFrom-HeapSize {
     return $null
 }
 
+function Read-HeapSizeValue {
+    # Collect a JVM heap value and guarantee it carries a unit.
+    #
+    # The JVM treats a bare number as BYTES, so a user answering '4096' (meaning 4 GB) produces
+    # -Xmx4096 = 4 KB, which is below the 256m minimum. The JVM then refuses to start with
+    #   Error occurred during initialization of VM
+    #   Initial heap size set to a larger value than the maximum heap size
+    # and the agent restart-loops. That message never reaches the installer, the service log, or the
+    # agent log - it is only visible if you run agent.bat in the foreground - so the value has to be
+    # validated here, at the point it is entered.
+    #
+    # A bare number is almost always intended as megabytes, so offer that rather than just rejecting.
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [AllowEmptyString()][string]$Default = ''
+    )
+    while ($true) {
+        $raw = (Read-PromptWithDefault -Prompt $Prompt -Default $Default).Trim()
+        if ([string]::IsNullOrWhiteSpace($raw)) { return '' }   # skipping is valid: agent uses its own default
+        if ($raw -match '^\d+[kKmMgG]$') { return $raw }
+        if ($raw -match '^\d+$') {
+            $suggested = "${raw}m"
+            Write-Log -Level Warn -Message "'$raw' has no unit. The JVM reads a bare number as BYTES, so this would set the heap to $raw bytes and the agent would fail to start."
+            if (Confirm-UserChoice -Prompt "Use $suggested (megabytes) instead?" -DefaultChoice 'y') { return $suggested }
+            continue
+        }
+        Write-Log -Level Warn -Message "Enter a number with a unit - k, m, or g (for example 2048m or 4g) - or press Enter to skip."
+    }
+}
+
 function Test-HeapOrder {
     # True when MemMin <= MemMax, or when either is blank/unparseable (nothing to enforce - the
     # design says only validate when MEM_MIN was collected and is non-blank).
@@ -2978,18 +3008,20 @@ function Read-SettingsInterview {
 
     Write-Host "`n--- JVM / Memory ---" -ForegroundColor Cyan
     & $showConflict $byKey['MEM_MAX']
-    $memMax = Read-PromptWithDefault -Prompt 'Max heap (MEM_MAX)' -Default ([string]$Defaults.MemMax)
+    # Read-HeapSizeValue, not Read-PromptWithDefault: a bare number is bytes to the JVM, so an
+    # unsuffixed value silently produces an agent that cannot start.
+    $memMax = Read-HeapSizeValue -Prompt 'Max heap (MEM_MAX)' -Default ([string]$Defaults.MemMax)
     $memMin = [string]$Defaults.MemMin
     $minEntry = $byKey['MEM_MIN']
     if ($minEntry -and $minEntry.HasConflict) {
         & $showConflict $minEntry
-        $memMin = Read-PromptWithDefault -Prompt 'Min heap (MEM_MIN)' -Default ([string]$Defaults.MemMin)
+        $memMin = Read-HeapSizeValue -Prompt 'Min heap (MEM_MIN)' -Default ([string]$Defaults.MemMin)
     }
     # Cross-field guard - never write a config that crashes the JVM at startup.
     while (-not (Test-HeapOrder -MemMin $memMin -MemMax $memMax)) {
         Write-Log -Level Warn -Message "MEM_MIN ($memMin) must be <= MEM_MAX ($memMax). Re-enter both."
-        $memMax = Read-PromptWithDefault -Prompt 'Max heap (MEM_MAX)' -Default ([string]$memMax)
-        $memMin = Read-PromptWithDefault -Prompt 'Min heap (MEM_MIN)' -Default ([string]$memMin)
+        $memMax = Read-HeapSizeValue -Prompt 'Max heap (MEM_MAX)' -Default ([string]$memMax)
+        $memMin = Read-HeapSizeValue -Prompt 'Min heap (MEM_MIN)' -Default ([string]$memMin)
     }
 
     # Reachability probe - preserved from Read-ClusterSettings (design Section 2 "Reachability probe").
