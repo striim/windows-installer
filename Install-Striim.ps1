@@ -1047,10 +1047,17 @@ function Test-RemoteUrlExists {
 }
 
 function Read-StriimVersion {
-    param([Parameter(Mandatory)][ValidateSet('A', 'N')][string]$NodeType)
+    # -SuggestedVersion pre-fills the prompt with the version already installed, so a reinstall of
+    # an existing 5.4.0.2A does not default to the newest known release and quietly become an
+    # upgrade. Explicitly typing another version still works; option [6] remains the upgrade path.
+    param(
+        [Parameter(Mandatory)][ValidateSet('A', 'N')][string]$NodeType,
+        [string]$SuggestedVersion
+    )
+    $default = if ($SuggestedVersion) { $SuggestedVersion } else { $script:DefaultStriimVersion }
     while ($true) {
-        $raw = Read-Host -Prompt "Striim version to install [$script:DefaultStriimVersion]"
-        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $script:DefaultStriimVersion }
+        $raw = Read-Host -Prompt "Striim version to install [$default]"
+        if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $default }
         $raw = $raw.Trim()
         $gate = Test-StriimVersionSupported -VersionString $raw
         if (-not $gate.Supported) {
@@ -1344,14 +1351,14 @@ function Select-StriimConfigBackup {
 
 function Read-InstallInterview {
     # All user decisions, collected once, in spec 2.2 order. No admin required.
-    param([string]$SuggestedPath)
+    param([string]$SuggestedPath, [string]$SuggestedVersion)
     Show-SystemSnapshot
     $profile = Show-PickList -Title 'Install profile:' -Items @(
         [pscustomobject]@{ NodeType = 'A'; Label = 'Striim Forwarding Agent (default)' },
         [pscustomobject]@{ NodeType = 'N'; Label = 'Striim Node' }
     ) -DisplayWith { param($i) $i.Label }
     $nodeType = $profile.NodeType
-    $targetVersion = Read-StriimVersion -NodeType $nodeType
+    $targetVersion = Read-StriimVersion -NodeType $nodeType -SuggestedVersion $SuggestedVersion
     $installPath = Read-InstallPath -NodeType $nodeType -SuggestedPath $SuggestedPath
     $restoreBackup = Select-StriimConfigBackup -NodeType $nodeType
     $backupDefaults = $null
@@ -3135,7 +3142,13 @@ function Invoke-MaintenanceCleanReinstall {
     Write-Log -Level Warn -Message "Clean reinstall clears $($Install.Path) except downloads\, logs\, and scripts."
     if (-not (Confirm-UserChoice -Prompt 'Continue with a clean reinstall?' -DefaultChoice 'n')) { return }
     $backup = New-ConfigBackupChoice -Install $Install -FlowName 'reinstall'
-    $interview = Read-InstallInterview
+    # Pre-fill the path of the install being reinstalled. Without this the prompt defaulted to the
+    # standard C:\striim\Agent, so on a machine with more than one install pressing Enter would
+    # silently reinstall over a DIFFERENT directory than the one selected from the picker.
+    $interview = Read-InstallInterview -SuggestedPath $Install.Path -SuggestedVersion $Install.Version
+    if ($interview.InstallPath.TrimEnd('\') -ine $Install.Path.TrimEnd('\')) {
+        Write-Log -Level Warn -Message "Path changed from $($Install.Path) to $($interview.InstallPath); the backup just taken is from $($Install.Path)."
+    }
     $plan = New-InstallPlan -Interview $interview -Probes (Get-SystemProbes) -Mode 'Reinstall' -Backup $backup
     Show-PlanReview -Plan $plan
     if (Confirm-UserChoice -Prompt 'Proceed?' -DefaultChoice 'y') { Invoke-PlanHandoff -Plan $plan }
@@ -3592,7 +3605,7 @@ function Show-MaintenanceMenu {
             '5' { Invoke-MaintenanceCleanReinstall -Install $Install }
             '6' { Invoke-MaintenanceUpgrade -Install $Install; return }
             '7' { Invoke-MaintenanceUninstall -Install $Install; return }
-            '8' { Invoke-FreshInstallFlow -ExistingInstall $Install; return }
+            '8' { Invoke-FreshInstallFlow -ExistingInstall $Install -SuggestedPath $Install.Path; return }
             '0' { return }
             default { Write-Log -Level Warn -Message 'Invalid selection.' }
         }
