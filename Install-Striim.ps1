@@ -3620,15 +3620,30 @@ function Stop-StriimServiceForce {
         }
     }
     $svc.Refresh()
-    if ($svc.Status -ne 'Stopped') {
-        $escaped = [regex]::Escape($InstallPath)
-        $wrappers = @(Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
+    $escaped = [regex]::Escape($InstallPath)
+    $findWrappers = {
+        @(Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -match $escaped })
-        foreach ($proc in $wrappers) {
-            Write-Log -Level Warn -Message "Killing wrapper process PID $($proc.ProcessId)."
-            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-        }
+    }.GetNewClosure()
+
+    # The SCM reports Stopped as soon as the wrapper acknowledges the stop, but its JVM child can
+    # still be shutting down and holding open file handles under lib\. A clean/remove immediately
+    # afterwards then fails with 'the process cannot access the file <jar> because it is being used
+    # by another process' - seen on a reinstall failing at commons-cli-1.4.jar, where Retry
+    # succeeded purely because a few seconds had passed. Wait for the children to actually exit
+    # rather than trusting the service state.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((& $findWrappers).Count -gt 0 -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
     }
+
+    foreach ($proc in @(& $findWrappers)) {
+        Write-Log -Level Warn -Message "Killing wrapper process PID $($proc.ProcessId) (still running after $TimeoutSeconds s)."
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    # Windows releases handles slightly after process exit; a short settle avoids a spurious
+    # first-attempt failure that only succeeds on Retry.
+    Start-Sleep -Seconds 2
 }
 
 function Uninstall-StriimWindowsService {
