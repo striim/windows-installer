@@ -2325,19 +2325,41 @@ function Test-WrapperConfInSync {
 }
 
 function Test-AgentConfigWritten {
-    # Required props present and non-empty - this is also the Verify-mode check.
+    # Required props present, non-empty, AND matching what the interview collected.
+    #
+    # This used to check presence only, which made the step a no-op on any flow where the config
+    # already had values - i.e. every Reconfigure. Changing a port (or the cluster name, or the
+    # server address) via maintenance option 3 was accepted at the prompt, echoed in the plan card,
+    # reported [OK], and then never written. Comparing values is what makes the step actually
+    # idempotent rather than merely inert.
     param([Parameter(Mandatory)][object]$Plan)
     $iv = $Plan.Interview
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
     $configPath = Join-Path $iv.InstallPath $artifacts.ConfigFile
     if (-not (Test-Path $configPath)) { return $false }
-    $required = if ($iv.NodeType -eq 'A') {
-        @('striim.cluster.clusterName', 'striim.node.servernode.address')
+
+    # key -> expected value ($null = only require non-empty, e.g. licence fields we do not re-derive)
+    $expected = [ordered]@{}
+    if ($iv.NodeType -eq 'A') {
+        $expected['striim.cluster.clusterName']        = [string]$iv.ClusterName
+        $expected['striim.node.servernode.address']    = [string]$iv.ServerAddress
+        $expected['striim.cluster.https.enabled']      = if ($iv.HttpsEnabled) { 'true' } else { 'false' }
+        if ($iv.PSObject.Properties['HttpPort']  -and $iv.HttpPort)  { $expected['striim.node.httpPort']  = [string]$iv.HttpPort }
+        if ($iv.PSObject.Properties['HttpsPort'] -and $iv.HttpsPort) { $expected['striim.node.httpsPort'] = [string]$iv.HttpsPort }
+        if ($iv.PSObject.Properties['HazelcastPort'] -and $iv.HazelcastPort) { $expected['striim.node.hazelcast.port'] = [string]$iv.HazelcastPort }
+        if ($iv.PSObject.Properties['SmartRouting'] -and $iv.SmartRouting -eq 'false') { $expected['striim.hazelcast.client.smartrouting'] = 'false' }
     } else {
-        @('CompanyName', 'LicenceKey', 'ProductKey', 'WAClusterName')
+        foreach ($p in @('CompanyName', 'LicenceKey', 'ProductKey')) { $expected[$p] = $null }
+        $expected['WAClusterName'] = [string]$iv.ClusterName
     }
-    foreach ($prop in $required) {
-        if ([string]::IsNullOrWhiteSpace((Get-ConfigProperty -ConfigPath $configPath -PropertyName $prop))) { return $false }
+    if (-not [string]::IsNullOrWhiteSpace($iv.MemMax)) { $expected['MEM_MAX'] = [string]$iv.MemMax }
+    if (-not [string]::IsNullOrWhiteSpace($iv.MemMin)) { $expected['MEM_MIN'] = [string]$iv.MemMin }
+
+    foreach ($prop in $expected.Keys) {
+        $actual = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName $prop)
+        if ([string]::IsNullOrWhiteSpace($actual)) { return $false }
+        $want = $expected[$prop]
+        if ($null -ne $want -and $actual.Trim() -ne $want.Trim()) { return $false }
     }
     return $true
 }
