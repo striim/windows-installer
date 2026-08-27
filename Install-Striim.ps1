@@ -253,8 +253,14 @@ function Test-StriimVersionSupported {
 # patch-jar step type (Task 14) consumes them, so future 5.x field patches are manifest-only changes.
 $script:AllDownloads = @(
     # NOTE: the ICU/MSSQLNative lib\ DLLs and the GitHub (StriimQueryAutoLoader) sources were
-    # removed - they were 4.2.0.20-era fixes; Striim 5.x ships its own natives. sqljdbc_auth.dll
-    # (Integrated Security) is no longer downloaded either: it ships NEXT TO THIS SCRIPT.
+    # removed - they were 4.2.0.20-era fixes; Striim 5.x ships its own natives.
+
+    # sqljdbc_auth.dll (Integrated Security). Striim does NOT ship this in lib\ - verified absent on
+    # 5.4.0.2A and 5.4.0.6 Agent packages - so it has to come from Microsoft. Listed here so that
+    # -DownloadOnly bundles it for air-gapped installs; the zip is unpacked by the auth DLL step,
+    # which takes x64\mssql-jdbc_auth-*.x64.dll and renames it. Pinned to the JDBC line Striim
+    # supports (12.x; 13.x is unsupported). GitHub release assets are immutable.
+    [pscustomobject]@{ Name = 'mssql-jdbc_auth.zip'; Url = $script:SqljdbcAuthUrl; Category = 'Prereq'; NodeType = $null; TargetFile = $null; MinVersion = '5.0'; MaxVersion = '99.9'; Sha256 = $null }
 
     # Java 17 (Microsoft Build of OpenJDK) - the only Java this wizard installs
     [pscustomobject]@{ Name = 'microsoft-jdk-17-windows-x64.msi'; Url = 'https://aka.ms/download-jdk/microsoft-jdk-17-windows-x64.msi'; Category = 'Java'; NodeType = $null; TargetFile = $null; MinVersion = '5.0'; MaxVersion = '99.9'; Sha256 = $null }
@@ -1195,8 +1201,24 @@ function Read-ClusterSettings {
     $serverAddress = ''
     while ([string]::IsNullOrWhiteSpace($serverAddress)) { $serverAddress = Read-PromptWithDefault -Prompt 'Striim server node address (hostname or IP)' -Default $defServer }
     $https = Confirm-UserChoice -Prompt 'Is HTTPS enabled on the cluster?' -DefaultChoice $defHttps
-    $port = if ($https) { 9081 } else { 9080 }
-    # Immediate, non-blocking reachability probe - surface firewall problems NOW.
+    # Transport ports. 9080/9081/5701 are the Striim defaults, but a cluster reached through
+    # Kubernetes NodePorts, a load balancer, or a port-remapping proxy listens elsewhere - seen in
+    # the field on 30002/30003/30000. The installer never asked for these and never wrote them, so
+    # the values had to be hand-edited into agent.conf after every install, and an upgrade silently
+    # reset them. Defaults are pre-filled from the existing install on reinstall/upgrade.
+    $defHttpPort  = if ($Defaults -and $Defaults.PSObject.Properties['HttpPort']  -and $Defaults.HttpPort)  { [string]$Defaults.HttpPort }  else { '9080' }
+    $defHttpsPort = if ($Defaults -and $Defaults.PSObject.Properties['HttpsPort'] -and $Defaults.HttpsPort) { [string]$Defaults.HttpsPort } else { '9081' }
+    $defHazelcast = if ($Defaults -and $Defaults.PSObject.Properties['HazelcastPort'] -and $Defaults.HazelcastPort) { [string]$Defaults.HazelcastPort } else { '' }
+    $defSmart     = if ($Defaults -and $Defaults.PSObject.Properties['SmartRouting'] -and $Defaults.SmartRouting -eq 'false') { 'n' } else { 'y' }
+    $httpPort  = Read-PortValue -Prompt 'Cluster HTTP port'  -Default $defHttpPort
+    $httpsPort = Read-PortValue -Prompt 'Cluster HTTPS port' -Default $defHttpsPort
+    $hazelcastPort = Read-PortValue -Prompt 'Hazelcast port (Enter to leave at the cluster default)' -Default $defHazelcast -AllowEmpty
+    # smartrouting=false tells the Hazelcast client not to connect to individual cluster members,
+    # which is required whenever members are not directly reachable (NodePorts, LB, NAT).
+    $smartRouting = Confirm-UserChoice -Prompt 'Can this host reach every cluster member directly? (answer n behind a load balancer or Kubernetes NodePorts)' -DefaultChoice $defSmart
+    $port = if ($https) { [int]$httpsPort } else { [int]$httpPort }
+    # Immediate, non-blocking reachability probe - surface firewall problems NOW. Uses the port the
+    # agent will actually use, not a hardcoded 9080/9081.
     $reachable = Test-ClusterReachability -ServerAddress $serverAddress.Trim() -Port $port
     if ($reachable) {
         Write-Log -Level Success -Message "Cluster auth port $port on $serverAddress is reachable."
@@ -1208,7 +1230,31 @@ function Read-ClusterSettings {
         ServerAddress = $serverAddress.Trim()
         HttpsEnabled  = $https
         AuthPort      = $port
+        HttpPort      = $httpPort
+        HttpsPort     = $httpsPort
+        HazelcastPort = $hazelcastPort
+        SmartRouting  = if ($smartRouting) { 'true' } else { 'false' }
         Reachable     = $reachable
+    }
+}
+
+function Read-PortValue {
+    # A TCP port, or empty when -AllowEmpty and the user skips. Rejects anything outside 1-65535 so
+    # a typo cannot silently produce an unreachable agent.
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [AllowEmptyString()][string]$Default = '',
+        [switch]$AllowEmpty
+    )
+    while ($true) {
+        $raw = (Read-PromptWithDefault -Prompt $Prompt -Default $Default).Trim()
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            if ($AllowEmpty) { return '' }
+            Write-Log -Level Warn -Message 'A port is required.'
+            continue
+        }
+        if ($raw -match '^\d+$' -and [int]$raw -ge 1 -and [int]$raw -le 65535) { return $raw }
+        Write-Log -Level Warn -Message "'$raw' is not a valid TCP port (1-65535)."
     }
 }
 
@@ -1379,7 +1425,7 @@ function Read-InstallInterview {
         $nodeLicense = Read-NodeLicenseSettings -Defaults $licenseDefaults
     }
     $memMaxDefault = if ($backupDefaults) { [string]$backupDefaults.MemMax } else { '' }
-    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX tuning value (e.g. 2048m or 4g; Enter to skip)' -Default $memMaxDefault
+    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX tuning value (e.g. 2048m; Enter to skip)' -Default $memMaxDefault
     $memMin = if ($backupDefaults) { [string]$backupDefaults.MemMin } else { '' }
     $integratedSecurity = Confirm-UserChoice -Prompt 'Use SQL Server Integrated Security (NT auth, places sqljdbc_auth.dll in System32)?' -DefaultChoice 'n'
     $drivers = @()
@@ -1928,20 +1974,33 @@ Download it, extract x64\mssql-jdbc_auth-*.x64.dll, and place that file in:
   $script:DownloadDir
 (no rename needed), then re-run this wizard.
 
+Alternatively drop the whole mssql-jdbc_auth.zip into that directory - this wizard will
+unpack it. On an air-gapped host, running -DownloadOnly on a connected machine bundles
+that zip for you.
+
 Alternatively answer 'n' to Integrated Security if you are using SQL Server authentication.
 "@
 }
 
 function Install-SqljdbcAuthDllFromWeb {
-    # Fetch Microsoft's auth package from the mssql-jdbc GitHub release and extract the x64 DLL into
-    # downloads\. GitHub release assets are immutable, so this URL either works or 404s - it never
-    # silently returns different content. Returns the extracted path, or $null on any failure: a
-    # download problem must degrade to the manual instructions, never abort the install.
+    # Obtain Microsoft's auth package and extract the x64 DLL into downloads\.
+    #
+    # Air-gapped installs: mssql-jdbc_auth.zip is in the manifest, so -DownloadOnly bundles it into
+    # downloads\ on the internet-connected machine. This function finds that copy and extracts from
+    # it WITHOUT any network access - the Get-RemoteFile call below is skipped entirely when the zip
+    # is already present. Nothing else is needed to make Integrated Security work offline.
+    #
+    # Returns the extracted path, or $null on any failure: a download problem must degrade to the
+    # manual instructions, never abort the install.
     $dest = Join-Path $script:DownloadDir 'mssql-jdbc_auth.zip'
     $work = Join-Path $script:DownloadDir 'mssql-jdbc_auth_extract'
     try {
-        Write-Log -Level Info -Message "Downloading sqljdbc_auth.dll from $script:SqljdbcAuthUrl"
-        Get-RemoteFile -Uri $script:SqljdbcAuthUrl -OutFile $dest
+        if (Test-Path $dest) {
+            Write-Log -Level Info -Message "Using bundled $(Split-Path $dest -Leaf) from downloads\ (no download needed)."
+        } else {
+            Write-Log -Level Info -Message "Downloading sqljdbc_auth.dll from $script:SqljdbcAuthUrl"
+            Get-RemoteFile -Uri $script:SqljdbcAuthUrl -OutFile $dest
+        }
         if (Test-Path $work) { Remove-Item -Path $work -Recurse -Force }
         Expand-Archive -Path $dest -DestinationPath $work -Force
         $dll = Get-ChildItem -Path $work -Recurse -Filter 'mssql-jdbc_auth-*.x64.dll' -File -ErrorAction SilentlyContinue |
@@ -2118,6 +2177,53 @@ function Set-ConfigFileProperties {
     Set-Content -Path $ConfigPath -Value $updated
 }
 
+function Get-ConfigFileProperties {
+    # Parse a Striim .conf/.properties file into an ordered key/value map. Commented and blank lines
+    # are ignored; only live 'key=value' lines are returned.
+    param([Parameter(Mandatory)][string]$ConfigPath)
+    $map = [ordered]@{}
+    if (-not (Test-Path $ConfigPath)) { return $map }
+    foreach ($line in @(Get-Content -LiteralPath $ConfigPath)) {
+        if ($line -match '^\s*[#;]') { continue }
+        if ($line -match '^\s*(?<k>[^=\s]+)\s*=\s*(?<v>.*)$') {
+            $map[$Matches['k']] = $Matches['v'].Trim()
+        }
+    }
+    return $map
+}
+
+function Get-CarryForwardProperties {
+    # Properties to preserve from a previous agent.conf across a reinstall/upgrade.
+    #
+    # Reinstall and Upgrade clean the install directory and extract a FRESH config from the zip, so
+    # anything the operator had customised is replaced by the shipped defaults. Write-AgentConfig
+    # then sets only the handful of properties the interview collects, and the restore step does not
+    # cover agent.conf. Everything else was therefore silently lost.
+    #
+    # Seen in the field on an agent talking to a Kubernetes-hosted cluster: httpPort/httpsPort had
+    # been moved to the NodePort range and smartrouting disabled, and an upgrade reset them to 9080
+    # /9081. The agent then timed out connecting, with nothing in the output to suggest why.
+    #
+    # Returns old values that (a) differ from the freshly-extracted default, and (b) are not owned by
+    # the interview - the user's answers must always win over a stale backup.
+    param(
+        [Parameter(Mandatory)][string]$OldConfigPath,
+        [Parameter(Mandatory)][string]$NewConfigPath,
+        [Parameter(Mandatory)][string[]]$InterviewOwnedKeys
+    )
+    $carry = [ordered]@{}
+    if (-not (Test-Path $OldConfigPath)) { return $carry }
+    $oldProps = Get-ConfigFileProperties -ConfigPath $OldConfigPath
+    $newProps = Get-ConfigFileProperties -ConfigPath $NewConfigPath
+    foreach ($key in $oldProps.Keys) {
+        if ($InterviewOwnedKeys -contains $key) { continue }
+        $oldValue = [string]$oldProps[$key]
+        $newValue = if ($newProps.Contains($key)) { [string]$newProps[$key] } else { $null }
+        if ($oldValue -ne $newValue) { $carry[$key] = $oldValue }
+    }
+    return $carry
+}
+
 function Write-AgentConfig {
     # Required/optional props carried from the OG:
     #   Agent: striim.cluster.clusterName, striim.node.servernode.address (+ striim.cluster.https.enabled, MEM_MAX)
@@ -2131,6 +2237,13 @@ function Write-AgentConfig {
         $props['striim.cluster.clusterName'] = $iv.ClusterName
         $props['striim.node.servernode.address'] = $iv.ServerAddress
         $props['striim.cluster.https.enabled'] = if ($iv.HttpsEnabled) { 'true' } else { 'false' }
+        # Transport ports - written explicitly so a non-default deployment (Kubernetes NodePorts,
+        # load balancer, port-remapping proxy) survives a reinstall or upgrade instead of silently
+        # reverting to the shipped 9080/9081.
+        if ($iv.PSObject.Properties['HttpPort']  -and $iv.HttpPort)  { $props['striim.node.httpPort']  = [string]$iv.HttpPort }
+        if ($iv.PSObject.Properties['HttpsPort'] -and $iv.HttpsPort) { $props['striim.node.httpsPort'] = [string]$iv.HttpsPort }
+        if ($iv.PSObject.Properties['HazelcastPort'] -and $iv.HazelcastPort) { $props['striim.node.hazelcast.port'] = [string]$iv.HazelcastPort }
+        if ($iv.PSObject.Properties['SmartRouting'] -and $iv.SmartRouting -eq 'false') { $props['striim.hazelcast.client.smartrouting'] = 'false' }
     } else {
         $props['CompanyName'] = $iv.NodeLicense.CompanyName
         $props['LicenceKey']  = $iv.NodeLicense.LicenceKey
@@ -2139,6 +2252,19 @@ function Write-AgentConfig {
     }
     if (-not [string]::IsNullOrWhiteSpace($iv.MemMax)) { $props['MEM_MAX'] = $iv.MemMax }
     if (-not [string]::IsNullOrWhiteSpace($iv.MemMin)) { $props['MEM_MIN'] = $iv.MemMin }
+    # Carry forward customisations from the previous install's config, which the clean+extract
+    # replaced with shipped defaults. Applied BEFORE the interview values below, so the user's
+    # answers always win. Only runs when a backup of the old config exists (reinstall/upgrade).
+    if ($Plan.PSObject.Properties['Backup'] -and $Plan.Backup -and $Plan.Backup.BackupDir) {
+        $oldConfig = Join-Path $Plan.Backup.BackupDir $artifacts.ConfigFile
+        $carry = Get-CarryForwardProperties -OldConfigPath $oldConfig -NewConfigPath $configPath `
+                                            -InterviewOwnedKeys @($props.Keys)
+        if ($carry.Count -gt 0) {
+            Set-ConfigFileProperties -ConfigPath $configPath -Properties $carry
+            Write-Log -Level Info -Message ("Carried forward {0} customised setting(s) from the previous {1}: {2}" -f `
+                $carry.Count, $artifacts.ConfigFile, (($carry.Keys) -join ', '))
+        }
+    }
     Set-ConfigFileProperties -ConfigPath $configPath -Properties $props
     # Keep wrapper.conf (yajsw service JVM args) in lockstep so the service does not silently override
     # agent.conf at JVM start. On a FRESH install wrapper.conf does not exist yet at this point - it is
@@ -2930,7 +3056,7 @@ function Read-HeapSizeValue {
             if (Confirm-UserChoice -Prompt "Use $suggested (megabytes) instead?" -DefaultChoice 'y') { return $suggested }
             continue
         }
-        Write-Log -Level Warn -Message "Enter a number with a unit - k, m, or g (for example 2048m or 4g) - or press Enter to skip."
+        Write-Log -Level Warn -Message "Enter a number with a unit - k, m, or g (for example 2048m) - or press Enter to skip."
     }
 }
 
@@ -3004,7 +3130,18 @@ function Read-SettingsInterview {
     while ([string]::IsNullOrWhiteSpace($serverAddress)) { $serverAddress = Read-PromptWithDefault -Prompt 'Striim server node address (hostname or IP)' -Default ([string]$Defaults.ServerAddress) }
     $defHttps = if (-not $Defaults.HttpsEnabled) { 'n' } else { 'y' }
     $https = Confirm-UserChoice -Prompt 'Is HTTPS enabled on the cluster?' -DefaultChoice $defHttps
-    $port = if ($https) { 9081 } else { 9080 }
+    # Transport ports, pre-filled from the current config. This is the path an operator reaches for
+    # when the cluster moves behind a load balancer or NodePorts, so it must be changeable here and
+    # not only during a reinstall.
+    $defHttpPort  = if ($Defaults.PSObject.Properties['HttpPort']  -and $Defaults.HttpPort)  { [string]$Defaults.HttpPort }  else { '9080' }
+    $defHttpsPort = if ($Defaults.PSObject.Properties['HttpsPort'] -and $Defaults.HttpsPort) { [string]$Defaults.HttpsPort } else { '9081' }
+    $defHazelcast = if ($Defaults.PSObject.Properties['HazelcastPort'] -and $Defaults.HazelcastPort) { [string]$Defaults.HazelcastPort } else { '' }
+    $defSmart     = if ($Defaults.PSObject.Properties['SmartRouting'] -and $Defaults.SmartRouting -eq 'false') { 'n' } else { 'y' }
+    $httpPort  = Read-PortValue -Prompt 'Cluster HTTP port'  -Default $defHttpPort
+    $httpsPort = Read-PortValue -Prompt 'Cluster HTTPS port' -Default $defHttpsPort
+    $hazelcastPort = Read-PortValue -Prompt 'Hazelcast port (Enter to leave at the cluster default)' -Default $defHazelcast -AllowEmpty
+    $smartRouting = Confirm-UserChoice -Prompt 'Can this host reach every cluster member directly? (answer n behind a load balancer or Kubernetes NodePorts)' -DefaultChoice $defSmart
+    $port = if ($https) { [int]$httpsPort } else { [int]$httpPort }
 
     Write-Host "`n--- JVM / Memory ---" -ForegroundColor Cyan
     & $showConflict $byKey['MEM_MAX']
@@ -3034,6 +3171,9 @@ function Read-SettingsInterview {
     return [pscustomobject]@{
         ClusterName = $clusterName.Trim(); ServerAddress = $serverAddress.Trim()
         HttpsEnabled = $https; AuthPort = $port; ClusterReachable = $reachable
+        HttpPort = $httpPort; HttpsPort = $httpsPort
+        HazelcastPort = $hazelcastPort
+        SmartRouting = if ($smartRouting) { 'true' } else { 'false' }
         MemMax = $memMax.Trim(); MemMin = $memMin.Trim()
     }
 }
@@ -3084,10 +3224,16 @@ function ConvertTo-InterviewFromInstall {
     }
     $configPath = Join-Path $Install.Path $artifacts.ConfigFile
     $clusterName = ''; $serverAddress = ''; $httpsEnabled = $true; $nodeLicense = $null
+    # Agent-only transport settings; stay empty for Node installs, which take the else branch below.
+    $httpPort = ''; $httpsPort = ''; $hazelcastPort = ''; $smartRouting = ''
     if ($Install.Type -eq 'A') {
         $clusterName = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.cluster.clusterName')
         $serverAddress = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.node.servernode.address')
         $httpsEnabled = ((Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.cluster.https.enabled') -ne 'false')
+        $httpPort      = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.node.httpPort')
+        $httpsPort     = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.node.httpsPort')
+        $hazelcastPort = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.node.hazelcast.port')
+        $smartRouting  = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'striim.hazelcast.client.smartrouting')
     } else {
         $clusterName = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'WAClusterName')
         # Carry the license over when complete; flows that need it ask when any prop is missing.
@@ -3098,7 +3244,14 @@ function ConvertTo-InterviewFromInstall {
         }
         if ($license.Count -eq 3) { $nodeLicense = $license }
     }
-    $authPort = if ($httpsEnabled) { 9081 } else { 9080 }
+    # Probe the port the agent actually uses. Hardcoding 9080/9081 meant that on a cluster reached
+    # through non-default ports this reported success (or failure) against a port nothing was
+    # listening on, so it could not catch the very misconfiguration it exists to catch.
+    $authPort = if ($httpsEnabled) {
+        if ($httpsPort) { [int]$httpsPort } else { 9081 }
+    } else {
+        if ($httpPort) { [int]$httpPort } else { 9080 }
+    }
     $reachable = $false
     if (-not [string]::IsNullOrWhiteSpace($serverAddress)) {
         $reachable = Test-ClusterReachability -ServerAddress $serverAddress -Port $authPort
@@ -3111,6 +3264,12 @@ function ConvertTo-InterviewFromInstall {
         ServerAddress = $serverAddress
         HttpsEnabled = $httpsEnabled
         AuthPort = $authPort
+        # Carried so Read-SettingsInterview / Read-InstallInterview can pre-fill them, rather than
+        # offering 9080/9081 to someone whose cluster listens elsewhere.
+        HttpPort = $httpPort
+        HttpsPort = $httpsPort
+        HazelcastPort = $hazelcastPort
+        SmartRouting = $smartRouting
         ClusterReachable = $reachable
         NodeLicense = $nodeLicense
         MemMax = [string](Get-ConfigProperty -ConfigPath $configPath -PropertyName 'MEM_MAX')
@@ -3162,6 +3321,10 @@ function Invoke-MaintenanceUpdateSettings {
     $interview.HttpsEnabled = $settings.HttpsEnabled
     $interview.AuthPort = $settings.AuthPort
     $interview.ClusterReachable = $settings.ClusterReachable
+    $interview.HttpPort = $settings.HttpPort
+    $interview.HttpsPort = $settings.HttpsPort
+    $interview.HazelcastPort = $settings.HazelcastPort
+    $interview.SmartRouting = $settings.SmartRouting
     $interview.MemMax = $settings.MemMax
     $interview.MemMin = $settings.MemMin
     if ($Install.Type -eq 'N') { $interview.NodeLicense = Read-NodeLicenseSettings }
