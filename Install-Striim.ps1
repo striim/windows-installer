@@ -253,8 +253,14 @@ function Test-StriimVersionSupported {
 # patch-jar step type (Task 14) consumes them, so future 5.x field patches are manifest-only changes.
 $script:AllDownloads = @(
     # NOTE: the ICU/MSSQLNative lib\ DLLs and the GitHub (StriimQueryAutoLoader) sources were
-    # removed - they were 4.2.0.20-era fixes; Striim 5.x ships its own natives. sqljdbc_auth.dll
-    # (Integrated Security) is no longer downloaded either: it ships NEXT TO THIS SCRIPT.
+    # removed - they were 4.2.0.20-era fixes; Striim 5.x ships its own natives.
+
+    # sqljdbc_auth.dll (Integrated Security). Striim does NOT ship this in lib\ - verified absent on
+    # 5.4.0.2A and 5.4.0.6 Agent packages - so it has to come from Microsoft. Listed here so that
+    # -DownloadOnly bundles it for air-gapped installs; the zip is unpacked by the auth DLL step,
+    # which takes x64\mssql-jdbc_auth-*.x64.dll and renames it. Pinned to the JDBC line Striim
+    # supports (12.x; 13.x is unsupported). GitHub release assets are immutable.
+    [pscustomobject]@{ Name = 'mssql-jdbc_auth.zip'; Url = $script:SqljdbcAuthUrl; Category = 'Prereq'; NodeType = $null; TargetFile = $null; MinVersion = '5.0'; MaxVersion = '99.9'; Sha256 = $null }
 
     # Java 17 (Microsoft Build of OpenJDK) - the only Java this wizard installs
     [pscustomobject]@{ Name = 'microsoft-jdk-17-windows-x64.msi'; Url = 'https://aka.ms/download-jdk/microsoft-jdk-17-windows-x64.msi'; Category = 'Java'; NodeType = $null; TargetFile = $null; MinVersion = '5.0'; MaxVersion = '99.9'; Sha256 = $null }
@@ -1379,7 +1385,7 @@ function Read-InstallInterview {
         $nodeLicense = Read-NodeLicenseSettings -Defaults $licenseDefaults
     }
     $memMaxDefault = if ($backupDefaults) { [string]$backupDefaults.MemMax } else { '' }
-    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX tuning value (e.g. 2048m or 4g; Enter to skip)' -Default $memMaxDefault
+    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX tuning value (e.g. 2048m; Enter to skip)' -Default $memMaxDefault
     $memMin = if ($backupDefaults) { [string]$backupDefaults.MemMin } else { '' }
     $integratedSecurity = Confirm-UserChoice -Prompt 'Use SQL Server Integrated Security (NT auth, places sqljdbc_auth.dll in System32)?' -DefaultChoice 'n'
     $drivers = @()
@@ -1928,20 +1934,33 @@ Download it, extract x64\mssql-jdbc_auth-*.x64.dll, and place that file in:
   $script:DownloadDir
 (no rename needed), then re-run this wizard.
 
+Alternatively drop the whole mssql-jdbc_auth.zip into that directory - this wizard will
+unpack it. On an air-gapped host, running -DownloadOnly on a connected machine bundles
+that zip for you.
+
 Alternatively answer 'n' to Integrated Security if you are using SQL Server authentication.
 "@
 }
 
 function Install-SqljdbcAuthDllFromWeb {
-    # Fetch Microsoft's auth package from the mssql-jdbc GitHub release and extract the x64 DLL into
-    # downloads\. GitHub release assets are immutable, so this URL either works or 404s - it never
-    # silently returns different content. Returns the extracted path, or $null on any failure: a
-    # download problem must degrade to the manual instructions, never abort the install.
+    # Obtain Microsoft's auth package and extract the x64 DLL into downloads\.
+    #
+    # Air-gapped installs: mssql-jdbc_auth.zip is in the manifest, so -DownloadOnly bundles it into
+    # downloads\ on the internet-connected machine. This function finds that copy and extracts from
+    # it WITHOUT any network access - the Get-RemoteFile call below is skipped entirely when the zip
+    # is already present. Nothing else is needed to make Integrated Security work offline.
+    #
+    # Returns the extracted path, or $null on any failure: a download problem must degrade to the
+    # manual instructions, never abort the install.
     $dest = Join-Path $script:DownloadDir 'mssql-jdbc_auth.zip'
     $work = Join-Path $script:DownloadDir 'mssql-jdbc_auth_extract'
     try {
-        Write-Log -Level Info -Message "Downloading sqljdbc_auth.dll from $script:SqljdbcAuthUrl"
-        Get-RemoteFile -Uri $script:SqljdbcAuthUrl -OutFile $dest
+        if (Test-Path $dest) {
+            Write-Log -Level Info -Message "Using bundled $(Split-Path $dest -Leaf) from downloads\ (no download needed)."
+        } else {
+            Write-Log -Level Info -Message "Downloading sqljdbc_auth.dll from $script:SqljdbcAuthUrl"
+            Get-RemoteFile -Uri $script:SqljdbcAuthUrl -OutFile $dest
+        }
         if (Test-Path $work) { Remove-Item -Path $work -Recurse -Force }
         Expand-Archive -Path $dest -DestinationPath $work -Force
         $dll = Get-ChildItem -Path $work -Recurse -Filter 'mssql-jdbc_auth-*.x64.dll' -File -ErrorAction SilentlyContinue |
@@ -2930,7 +2949,7 @@ function Read-HeapSizeValue {
             if (Confirm-UserChoice -Prompt "Use $suggested (megabytes) instead?" -DefaultChoice 'y') { return $suggested }
             continue
         }
-        Write-Log -Level Warn -Message "Enter a number with a unit - k, m, or g (for example 2048m or 4g) - or press Enter to skip."
+        Write-Log -Level Warn -Message "Enter a number with a unit - k, m, or g (for example 2048m) - or press Enter to skip."
     }
 }
 
