@@ -970,7 +970,7 @@ function Find-StriimConfigBackups {
                 When        = $dir.LastWriteTime
                 Source      = [string](Get-Content -Path $manifest -TotalCount 1)
                 ConfigPath  = $confPath
-                HasKeystore = (Test-Path (Join-Path $dir.FullName $artifacts.JksFile)) -and
+                HasKeystore = ($null -ne (Get-ExistingKeystorePath -InstallPath $dir.FullName -NodeType $artifacts.NodeType)) -and
                               (Test-Path (Join-Path $dir.FullName $artifacts.PwdFile))
                 JarNames    = @(Get-ChildItem -Path (Join-Path $dir.FullName 'lib') -Filter '*.jar' -File -ErrorAction SilentlyContinue |
                                   ForEach-Object { $_.Name })
@@ -1452,6 +1452,15 @@ function Read-InstallInterview {
         ServerAddress      = $cluster.ServerAddress
         HttpsEnabled       = $cluster.HttpsEnabled
         AuthPort           = $cluster.AuthPort
+        # Transport ports MUST be carried through. Read-ClusterSettings collects and returns them,
+        # but they were not copied onto the interview object, so Write-AgentConfig never saw them
+        # and a fresh install silently kept the shipped 9080/9081 defaults - even though the user
+        # had been prompted for, and entered, the correct NodePorts. Only the maintenance settings
+        # flow assigned them, which is why the fresh-install path went unnoticed.
+        HttpPort           = $cluster.HttpPort
+        HttpsPort          = $cluster.HttpsPort
+        HazelcastPort      = $cluster.HazelcastPort
+        SmartRouting       = $cluster.SmartRouting
         ClusterReachable   = $cluster.Reachable
         NodeLicense        = $nodeLicense
         MemMax             = $memMax
@@ -2516,11 +2525,27 @@ function Invoke-KeystoreConfig {
     }
 }
 
+function Get-ExistingKeystorePath {
+    # Full path to whichever keystore format is present (.jks or .p12), or $null. Callers must not
+    # assume .jks - a FIPS-mode host produces PKCS12 and both are equally valid.
+    param(
+        [Parameter(Mandatory)][string]$InstallPath,
+        [Parameter(Mandatory)][string]$NodeType
+    )
+    $artifacts = Get-ProfileArtifacts -NodeType $NodeType
+    $candidates = if ($artifacts.PSObject.Properties['KeystoreFiles']) { @($artifacts.KeystoreFiles) } else { @($artifacts.JksFile) }
+    foreach ($relative in $candidates) {
+        $full = Join-Path $InstallPath $relative
+        if (Test-Path $full) { return $full }
+    }
+    return $null
+}
+
 function Test-KeystoreFilesExist {
     param([Parameter(Mandatory)][object]$Plan)
     $iv = $Plan.Interview
     $artifacts = Get-ProfileArtifacts -NodeType $iv.NodeType
-    return (Test-Path (Join-Path $iv.InstallPath $artifacts.JksFile)) -and
+    return ($null -ne (Get-ExistingKeystorePath -InstallPath $iv.InstallPath -NodeType $iv.NodeType)) -and
            (Test-Path (Join-Path $iv.InstallPath $artifacts.PwdFile))
 }
 
@@ -2571,7 +2596,7 @@ function Get-RestorableBackupFiles {
     $artifacts = Get-ProfileArtifacts -NodeType $NodeType
     $files = New-Object System.Collections.ArrayList
     if ($IncludeKeystore) {
-        foreach ($relative in @($artifacts.JksFile, $artifacts.PwdFile)) {
+        foreach ($relative in @(@($artifacts.KeystoreFiles) + $artifacts.PwdFile)) {
             if (Test-Path (Join-Path $BackupDir $relative)) { [void]$files.Add($relative) }
         }
     }
@@ -3486,7 +3511,7 @@ function Invoke-MaintenanceUpgrade {
     $backup = New-ConfigBackupChoice -Install $Install -FlowName 'upgrade' -Required
     $interview.Version = $targetVersion
     $interview.RestoreFrom = $backup.BackupDir
-    $interview.RestoreKeystore = (Test-Path (Join-Path $Install.Path $artifacts.JksFile)) -and
+    $interview.RestoreKeystore = ($null -ne (Get-ExistingKeystorePath -InstallPath $Install.Path -NodeType $Install.Type)) -and
                                  (Test-Path (Join-Path $Install.Path $artifacts.PwdFile))
     if (-not $interview.RestoreKeystore) {
         Write-Log -Level Warn -Message 'No keystore pair found in the current install - a new keystore will be generated interactively at the end.'
@@ -3568,7 +3593,7 @@ function Backup-StriimConfig {
     New-Item -ItemType Directory -Force -Path (Join-Path $BackupDir 'conf') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $BackupDir 'lib') | Out-Null
     $copied = New-Object System.Collections.ArrayList
-    foreach ($relative in @($artifacts.ConfigFile, $artifacts.JksFile, $artifacts.PwdFile)) {
+    foreach ($relative in @(@($artifacts.ConfigFile) + @($artifacts.KeystoreFiles) + $artifacts.PwdFile)) {
         $source = Join-Path $InstallPath $relative
         if (Test-Path $source) {
             Copy-Item -Path $source -Destination (Join-Path $BackupDir $relative) -Force
@@ -4058,9 +4083,9 @@ function Get-ExecutionSteps {
                     # cluster, and the SCM still reports Running - the service looks healthy while
                     # being unusable. Refuse rather than produce that state. This is the common
                     # follow-on from an install where the keystore step was deferred.
-                    $jks = Join-Path $iv.InstallPath $artifacts.JksFile
+                    $jks = Get-ExistingKeystorePath -InstallPath $iv.InstallPath -NodeType $iv.NodeType
                     $pwdFile = Join-Path $iv.InstallPath $artifacts.PwdFile
-                    if (-not ((Test-Path $jks) -and (Test-Path $pwdFile))) {
+                    if (-not (($null -ne $jks) -and (Test-Path $pwdFile))) {
                         $ksBat = Join-Path $iv.InstallPath $artifacts.KeystoreScript
                         throw ("Keystore missing ({0} / {1}). The service would start but could not " +
                                "authenticate to cluster '{2}'. Generate it first from an elevated prompt:`n    `"{3}`"" -f
