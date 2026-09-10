@@ -704,6 +704,13 @@ function Get-ProfileArtifacts {
             ConfigFile = 'conf\agent.conf'
             WrapperConfRelPath = $script:WrapperConfRelPaths['A']
             JksFile = 'conf\aks.jks'; PwdFile = 'conf\aksKey.pwd'; KeystoreScript = 'bin\aksConfig.bat'
+            # The keystore script emits PKCS12 (.p12) instead of JKS when the host runs in FIPS mode
+            # - JKS is not FIPS-compliant. Seen in the field: aksConfig.bat reported 'Successfully
+            # updated Striim AgentKeyStore' and wrote conf\aks.p12, but every check looked only for
+            # aks.jks, so the step failed on a keystore that had been created correctly. JksFile
+            # stays as the display/default name; KeystoreFiles is what existence checks and the
+            # backup enumerate.
+            KeystoreFiles = @('conf\aks.jks', 'conf\aks.p12')
             ServiceSetupScript = 'setupWindowsAgent.ps1'; ServiceConfigDir = 'conf\windowsAgent'
             DefaultSubPath = 'striim\Agent'
         }
@@ -713,6 +720,7 @@ function Get-ProfileArtifacts {
         ConfigFile = 'conf\startUp.properties'
         WrapperConfRelPath = $script:WrapperConfRelPaths['N']
         JksFile = 'conf\sks.jks'; PwdFile = 'conf\sksKey.pwd'; KeystoreScript = 'bin\sksConfig.bat'
+        KeystoreFiles = @('conf\sks.jks', 'conf\sks.p12')
         ServiceSetupScript = 'setupWindowsService.ps1'; ServiceConfigDir = 'conf\windowsService'
         DefaultSubPath = 'striim'
     }
