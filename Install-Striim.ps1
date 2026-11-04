@@ -2818,6 +2818,18 @@ function Get-VerifySteps {
         $findings = Find-JavaInstallations
         $pathOk = @($findings | Where-Object { $_.Source -eq 'PATH' -and $_.Major -eq 17 }).Count -gt 0
         $homeOk = @($findings | Where-Object { $_.Source -eq 'JAVA_HOME' -and $_.Major -eq 17 }).Count -gt 0
+        if (-not ($pathOk -and $homeOk)) {
+            $pathJava = $findings | Where-Object { $_.Source -eq 'PATH' -and $_.Major -eq 17 } | Select-Object -First 1
+            if ($pathJava -and -not $homeOk) {
+                # Derive the JDK root from ...\<jdk>\bin\java.exe and hand the user the exact fix.
+                $jdkRoot = Split-Path (Split-Path $pathJava.Path -Parent) -Parent
+                Write-Log -Level Warn -Message "JAVA_HOME is not set to Java 17 (java 17 is on PATH at $($pathJava.Path)). Run in an elevated PowerShell, then open a NEW window: [Environment]::SetEnvironmentVariable('JAVA_HOME', '$jdkRoot', 'Machine')"
+            } elseif (-not $pathOk -and $homeOk) {
+                Write-Log -Level Warn -Message "JAVA_HOME points at Java 17 but 'java' on PATH does not resolve to it. Put %JAVA_HOME%\bin first in the machine PATH, then open a NEW PowerShell window."
+            } else {
+                Write-Log -Level Warn -Message "Java 17 was not found on PATH or JAVA_HOME. Install the Microsoft Build of OpenJDK 17, then re-run Verify."
+            }
+        }
         $pathOk -and $homeOk
     }))
     if ($iv.IntegratedSecurity) {
