@@ -762,7 +762,8 @@ function Get-PlatformJarVersion {
     # Version may carry a hotfix letter suffix (Platform-5.4.0.2A.jar) - keep it,
     # since release URLs and display use the full string.
     param([Parameter(Mandatory)][string]$JarFileName)
-    if ($JarFileName -match '^Platform-(\d+(\.\d+)*[A-Za-z]*)\.jar$') { return $Matches[1] }
+    # An optional build-tag suffix is ignored (Platform-5.4.2.2-Striim-Nov1.jar -> 5.4.2.2).
+    if ($JarFileName -match '^Platform-(\d+(\.\d+)*[A-Za-z]*)(-[A-Za-z0-9_.-]+)?\.jar$') { return $Matches[1] }
     return $null
 }
 
