@@ -214,11 +214,7 @@ Press Enter to close this window:
 
 The summary tags are: `[DONE]` (a missing item was just installed), `[OK]` (already present, nothing to do), `[PASS]`/`[FAIL]` (a verify check), and `[SKIP]` (a non-critical step you skipped).
 
-If you skipped the keystore passwords in the interview, the keystore configuration step runs **last** and prompts you interactively — everything before it is hands-off:
-
-```
-[INFO   ] One final step needs your input: keystore configuration.
-```
+If you skipped any keystore password in the interview — or used characters that cannot be passed safely on the command line — the keystore step is **deferred** (`[TODO]` in the summary), and the **Next steps** block prints the exact `aksConfig.bat` / `sksConfig.bat` command to run interactively from an elevated prompt after the install finishes.
 
 ---
 
@@ -234,11 +230,11 @@ The interview is collected in the exact order below. Where a value can be prefil
 | **Restore a prior config backup?** *(only when backups exist)* | If `<drive>:\striim_backups\` holds backups, a pick list shows them newest-first with what each contains. The chosen backup's cluster settings become press-Enter defaults; its keystore pair, `log4j*.properties` logging config, and non-default JDBC jars are copied back automatically after extraction. |
 | **Cluster name / Server address / HTTPS** | The Striim cluster this agent joins, a server node hostname/IP, and whether HTTPS is enabled (auth port `9081` for HTTPS, `9080` for HTTP). The wizard probes the address/port immediately and warns **now** if it's unreachable. |
 | **License details** *(Node only)* | `CompanyName`, `LicenceKey`, and `ProductKey` — required for a Node, never asked for an Agent. |
-| **MEM_MAX** | Optional JVM max-heap value (e.g. `2048m`). Press Enter to skip. |
+| **MEM_MAX** | JVM max-heap value (e.g. `2048m` or `4g`). Defaults to **65% of physical RAM** rounded to the nearest whole GB (minimum `1g`, or blank if RAM cannot be read), or the existing value when restoring a backup. Press Enter to accept the default, or clear it to skip and keep Striim's own default. |
 | **SQL Server Integrated Security?** | If yes, `sqljdbc_auth.dll` is placed in `C:\Windows\System32` for NT (Windows) authentication to SQL Server. Default is no. |
 | **JDBC drivers** *(Agent only)* | A multi-select checklist (e.g. `1,4`, `all`, or Enter for none). Manual-path drivers prompt for a vendor jar/dir, validated immediately. |
-| **Windows service?** | Registers `Striim Agent` (or `Striim` for a Node) as a Windows service. Default is yes. |
-| **Keystore + sys passwords** | Optional. Provide both and keystore generation is fully automatic; skip either and the keystore script runs interactively as the final step. Input is masked, and passwords are never written to disk in plaintext. |
+| **Windows service?** | Registers `Striim Agent` (`com.webaction.agent.Agent`) for an Agent, or `Striim` (`com.webaction.runtime.Server`) and `Derby` for a Node, as Windows services using the quoted full Java 17 path. Default is yes. |
+| **Keystore passwords** | Optional. Prompts for the keystore and cluster `sys` passwords (plus the cluster `admin` password for a Node). Provide all required passwords using command-line-safe characters (letters, digits, and `@#$*_+-[]{}:./?~`) and keystore generation runs automatically; skip any password or use other characters and keystore generation is deferred to run interactively after the install. Input is masked, and passwords are never written to disk in plaintext. |
 
 ### Picking the install profile
 
@@ -341,7 +337,9 @@ Agent keystore password (press Enter to skip)
 Cluster 'sys' user password (press Enter to skip)
 ```
 
-Password input is masked. Provide both to make keystore generation automatic; leave either blank to run `aksConfig.bat` / `sksConfig.bat` interactively as the last step.
+For a **Node**, the wizard prompts for three passwords: `Node keystore password`, `Cluster 'sys' user password`, and `Cluster 'admin' user password` (passed to `sksConfig.bat` with `-k`, `-s`, and `-a`; an Agent passes `-k` and `-p` to `aksConfig.bat`).
+
+Password input is masked and encrypted with Windows DPAPI in the temporary plan file (`install-plan.json`). Provide all required passwords using command-line-safe characters (letters, digits, and `@#$*_+-[]{}:./?~`) to generate the keystore automatically. If any password is left blank — or contains characters outside that set (such as `%`, `"`, `&`, `|`, `<`, `>`, `^`, or spaces) — the wizard logs a warning (never the password itself) and defers keystore generation so you can run `aksConfig.bat` / `sksConfig.bat` interactively from an elevated prompt after the install finishes.
 
 ---
 
@@ -357,10 +355,10 @@ Only the items that are **missing** are installed — anything already present i
 | Microsoft OLE DB Driver for SQL Server | Required for MSJet (installed silently with `IACCEPTMSOLEDBSQLLICENSETERMS=YES`). Already-installed versions outside the known-good list (`18.2.3.0`, `18.7.4.0`) produce a warning, not a block. |
 | `sqljdbc_auth.dll` | → `C:\Windows\System32` (only if you chose Integrated Security). Copied from Striim's own `lib\` after extraction (with the script dir and `downloads\` as fallbacks) — nothing is downloaded. |
 | System PATH | `<install>\lib` is appended to the machine PATH (deduplicated; removed again on uninstall). |
-| Configuration | `conf\agent.conf` (Agent: cluster name, server address, HTTPS flag) or `conf\startUp.properties` (Node: company/license/product keys, cluster name), plus `MEM_MAX`/`MEM_MIN` if provided. Existing files are edited in place — properties are set or uncommented, never duplicated. The matching service `wrapper.conf` JVM args are kept in lockstep (see [Update Striim settings](#maintenance-menu-existing-installs)). |
+| Configuration | `conf\agent.conf` (Agent: cluster name, server address, HTTPS flag) or `conf\startUp.properties` (Node: company/license/product keys, cluster name), plus `MEM_MAX`/`MEM_MIN` if provided (`MEM_MAX` defaults to 65% of physical RAM rounded to the nearest whole GB, minimum `1g`, or the backed-up value when restoring). Existing files are edited in place — properties are set or uncommented, never duplicated. The matching service `wrapper.conf` JVM args are kept in lockstep (see [Update Striim settings](#maintenance-menu-existing-installs)). |
 | JDBC drivers | Selected jars → `<install>\lib\`. Oracle Instant Client is extracted to `<install>\oracle_instant_client` and wired up via `NATIVE_LIBS` in `agent.conf`. |
-| Windows service | `Striim Agent` / `Striim`, registered via the official Striim service-wrapper package (yajsw) for your exact version. |
-| Keystore | Generated via Striim's `aksConfig.bat` (Agent) / `sksConfig.bat` (Node). |
+| Windows service | `Striim Agent` (`com.webaction.agent.Agent`) for an Agent, or `Striim` (`com.webaction.runtime.Server`) and `Derby` for a Node, registered via Striim's official service-wrapper package (yajsw) for your exact version. Before registering, the wizard rewrites `wrapper.java.command` in the shipped `wrapper.conf.*` templates (`wrapper.conf.agent`, `wrapper.conf.server`, `wrapper.conf.derby`) from bare `java` to the full Java 17 `java.exe` path, so every registered service starts with a quoted full-path `ImagePath`. During service setup, `JAVA_HOME` is temporarily pointed at the JDK 17 directory only when `<home>\bin\java.exe` exists (otherwise unset so yajsw's installer falls back to `PATH`), and restored afterwards. After setup, any existing registration belonging to this install (matching `-Dwrapper.config` inside this install's service config folder) that still uses a bare `java.exe` or an unquoted path with spaces is repaired to the quoted full path, and all expected services (including `Derby` on a Node) are verified. |
+| Keystore | Generated via Striim's `aksConfig.bat` (Agent: keystore + `sys` passwords) / `sksConfig.bat` (Node: keystore + `sys` + `admin` passwords), or deferred to run interactively if any password is skipped or contains characters outside the command-line-safe set. |
 | The installer itself | A copy of `Install-Striim.ps1` is placed in the install directory so future maintenance runs can be launched right from there. |
 
 All downloads are fetched with `curl.exe` (resume + automatic retries), falling back to BITS and then a direct HTTPS stream on systems without curl. Interrupted downloads land in `<name>.partial` and resume where they left off.
@@ -459,7 +457,7 @@ Select:
 | **3 — Update Striim settings** | Re-asks the cluster settings, server address, HTTPS, and JVM heap, then rewrites **both** `agent.conf` **and** the service `wrapper.conf`, and restarts the service. See [Conflict-aware settings update](#conflict-aware-settings-update-option-3) below. |
 | **4 — Manage service** | Shows the live service status, the account it runs under, and its PID, then lets you **Start**, **Stop**, or **Restart** the service from inside the wizard. See [Manage service](#manage-service-option-4) below. |
 | **5 — Clean reinstall** | First offers the same config backup as uninstall (default **yes**, to `<drive>:\striim_backups\reinstall_<version>_<timestamp>\`), then clears the install directory — **always preserving** `downloads\`, `logs\`, and the installer scripts — and runs the full interview and install again. |
-| **6 — Upgrade version** | The official upgrade procedure as one plan. Settings are read from the live config **before anything is touched**; the wizard then backs everything up to `<drive>:\striim_backups\upgrade_<oldversion>_<timestamp>\` (mandatory), stops and deregisters the old service (the wrapper is version-specific), cleans the directory, installs the new version, restores your keystore, log4j logging config, and non-default JDBC jars, and re-registers the service. See [Upgrade](#upgrade-version-option-6) below. |
+| **6 — Upgrade version** | The official upgrade procedure as one plan. Settings are read from the live config **before anything is touched**; the wizard then backs everything up to `<drive>:\striim_backups\upgrade_<oldversion>_<timestamp>\` (mandatory), stops and deregisters the old service (the wrapper is version-specific), cleans the directory, installs the new version, restores your keystore, log4j logging config, and non-default JDBC jars, rewrites the new `wrapper.conf.*` templates with the full Java 17 path, and re-registers the service (repairing any remaining bare-`java.exe` registration belonging to this install, such as `Derby` on a Node). See [Upgrade](#upgrade-version-option-6) below. |
 | **7 — Uninstall** | Full removal — see [Uninstalling](#uninstalling). |
 | **8 — New install** | Runs the full install interview even though an install was detected — for a second copy on another path, the other profile, or rebuilding a broken install. If the path you pick is the detected install's own path, the wizard switches to a clean-reinstall plan automatically (with the backup offer). |
 
@@ -524,7 +522,7 @@ Installed version: 5.4.0.6. Enter the version to upgrade to.
 Striim version to install [5.4.0.6]: 5.5.0.1
 ```
 
-If the target isn't newer than the installed version, you're warned and asked to confirm. The agent keeps its cluster identity — no keystore re-enrollment, no retyped settings — because the keystore, log4j logging config, and non-default jars are restored from the mandatory pre-upgrade backup.
+If the target isn't newer than the installed version, you're warned and asked to confirm. The agent keeps its cluster identity — no keystore re-enrollment, no retyped settings — because the keystore, log4j logging config, and non-default jars are restored from the mandatory pre-upgrade backup. The new wrapper templates are updated with the full Java 17 path before re-registration, and any remaining bare-`java.exe` service registration belonging to the install (such as `Derby` on a Node) is repaired to the quoted full path.
 
 ---
 
@@ -629,7 +627,7 @@ When a step fails you'll see `[R]etry / [S]kip / [A]bort` (or `[R]etry / [A]bort
 | *"A newer version of this runtime is already installed"* (exit code 5100) | A VC++ 2015-2022 runtime is present. MSJet needs the 2015-2019 line — uninstall *Microsoft Visual C++ 2015-2022 Redistributable (x64)* via **Settings → Apps**, then choose **Retry**. |
 | A download keeps failing | Check proxy/firewall rules for the hosts in [Network requirements](#network-requirements). Partially-downloaded files resume on Retry. As a last resort, build a bundle on another machine with [`-DownloadOnly`](#offline--air-gapped-installs) and copy `downloads\` over. |
 | *"PATH resolves java to \<not 17\>"* warning | Another Java (8/11) sits earlier on the PATH. The agent uses whatever `java` resolves first. Reorder the machine PATH so JDK 17 wins, or ensure `JAVA_HOME` points at the JDK 17 directory. The warning names the exact offending Java and its location. |
-| Keystore step fails | Re-run the wizard and use maintenance **[1] Verify** to see what's missing. The keystore scripts require the cluster `sys` password — verify it's correct and the cluster is reachable. |
+| Keystore step fails | Re-run the wizard and use maintenance **[1] Verify** to see what's missing. The keystore scripts require the cluster `sys` password (and the `admin` password for a Node) — verify they are correct and the cluster is reachable. |
 | Checksum mismatch on a cached or downloaded file | A cached file that fails its SHA-256 is re-downloaded automatically. A freshly downloaded mismatch prompts: *"Checksum mismatch - keep the file anyway? (y/N)"* — answer no to discard and retry. |
 | Elevated window closed / machine rebooted mid-install | Run the script again. Detection finds the partial install, and every step skips what's already done — the wizard picks up where it left off (a partially-extracted directory may need maintenance **[5] Clean reinstall**). |
 
@@ -638,7 +636,7 @@ When a step fails you'll see `[R]etry / [S]kip / [A]bort` (or `[R]etry / [A]bort
 | Symptom | Fix |
 |---|---|
 | Agent doesn't appear under **Monitor → Agents** in the Striim console | 1) `Get-Service 'Striim Agent'` — is it Running? Start it if not. 2) Check `<install>\logs\` for connection errors. 3) Confirm cluster name and server address: maintenance **[3] Update Striim settings**. 4) Confirm the keystore/`sys` password were correct. 5) Re-check firewall ports (the verify report includes a live reachability check). |
-| Service won't start | Check `<install>\logs\` for the agent's own error. Common causes: wrong cluster credentials, an over-large `MEM_MAX` for the machine's RAM, or the cluster being down. |
+| Service won't start | Check `<install>\logs\` for the agent's own error. Common causes: wrong cluster credentials, an over-large `MEM_MAX` for the machine's RAM, the cluster being down, or an older install whose Windows service `ImagePath` starts with a bare `java.exe` (Windows services only see the system `PATH` from the last boot, so they can fail right after Java 17 is installed or pick up an older Java). **Automatic fix:** run an upgrade or reinstall with the current `Install-Striim.ps1`. **Manual remedy for an older install:** inspect `(Get-CimInstance Win32_Service -Filter "DisplayName='Striim Agent'").PathName` (or under `HKLM:\SYSTEM\CurrentControlSet\Services\<service>` — for a Node, check both `com.webaction.runtime.Server` and `Derby`) and replace only the leading bare `java.exe` with the **double-quoted** full path to Java 17's `java.exe` (for example `"C:\Program Files\Microsoft\jdk-17.0.21.21-hotspot\bin\java.exe" -classpath ...`), keeping everything after it unchanged. Update `wrapper.java.command` in `wrapper.conf` as well if you ever re-run `installService.bat` manually. |
 | New JDBC driver not being used | Drivers only load at service start. Maintenance **[2] Add/refresh JDBC drivers** restarts the service for you; if you copied a jar in manually, restart the service yourself: `Restart-Service 'Striim Agent'`. |
 | Verify shows a red `[FAIL]` line | Each verify line maps to one requirement. Re-run the wizard — the install flow only acts on what's missing, so it functions as a targeted repair. |
 | OLE DB driver version warning | An OLE DB Driver for SQL Server is installed but isn't a version this wizard has validated (`18.2.3.0`, `18.7.4.0`). It usually works; if you see MSJet connection issues, contact Striim support with the transcript. |
@@ -652,7 +650,7 @@ Send Striim support the install transcript (`<install>\logs\install-*.log`). It 
 
 ## Security notes
 
-- **Passwords are never written to disk in plaintext.** Keystore and `sys` passwords are collected as masked secure input. When the wizard hands off to its elevated process, they're encrypted with Windows DPAPI under your user account — the plan file is useless to any other user or machine — and the file is deleted as soon as execution completes.
+- **Passwords are never written to disk in plaintext.** Keystore, `sys`, and (for a Node) `admin` passwords are collected as masked secure input. When the wizard hands off to its elevated process, they're encrypted with Windows DPAPI under your user account — the plan file is useless to any other user or machine — and the file is deleted as soon as execution completes. If any password contains characters outside the command-line-safe allowlist (letters, digits, and `@#$*_+-[]{}:./?~`), the wizard does not pass it through `cmd.exe` and defers keystore generation to interactive entry.
 - **Transcripts never contain passwords.** The wizard echoes the plan into the transcript (mode, version, path, cluster, server, service, drivers) but excludes secrets by construction.
 - **One elevation, reviewed first.** Nothing on the machine changes until you've approved the plan card, and admin rights are requested exactly once per flow.
 - **Checksums.** Offline bundles ship with SHA-256 hashes in `manifest.json`; cached files with known hashes are re-verified before use.

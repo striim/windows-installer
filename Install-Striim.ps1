@@ -991,6 +991,15 @@ function Find-StriimConfigBackups {
 #endregion Detect
 
 #region Interview
+function Get-DefaultMemMax {
+    # Suggested MEM_MAX for a fresh install: 65% of physical RAM, rounded to the nearest GB
+    # (minimum 1g). '' when RAM cannot be read, which keeps Striim's own default.
+    $ram = (Get-SystemSpecs).RamGB
+    if (-not $ram) { return '' }
+    $gb = [math]::Max(1, [int][math]::Round([double]$ram * 0.65, [MidpointRounding]::AwayFromZero))
+    return "${gb}g"
+}
+
 function Get-SystemSpecs {
     $ram = $null; $cores = $null
     $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
@@ -1433,8 +1442,8 @@ function Read-InstallInterview {
         $licenseDefaults = if ($backupDefaults) { $backupDefaults.NodeLicense } else { $null }
         $nodeLicense = Read-NodeLicenseSettings -Defaults $licenseDefaults
     }
-    $memMaxDefault = if ($backupDefaults) { [string]$backupDefaults.MemMax } else { '' }
-    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX tuning value (e.g. 2048m; Enter to skip)' -Default $memMaxDefault
+    $memMaxDefault = if ($backupDefaults -and $backupDefaults.MemMax) { [string]$backupDefaults.MemMax } else { Get-DefaultMemMax }
+    $memMax = Read-HeapSizeValue -Prompt 'MEM_MAX max heap (default: 65% of RAM, or the backed-up value)' -Default $memMaxDefault
     $memMin = if ($backupDefaults) { [string]$backupDefaults.MemMin } else { '' }
     $integratedSecurity = Confirm-UserChoice -Prompt 'Use SQL Server Integrated Security (NT auth, places sqljdbc_auth.dll in System32)?' -DefaultChoice 'n'
     $drivers = @()
@@ -1445,13 +1454,21 @@ function Read-InstallInterview {
         $drivers = Read-JdbcDriverSelection
     }
     $installService = Confirm-UserChoice -Prompt 'Register Striim as a Windows service?' -DefaultChoice 'y'
-    $keystorePassword = $null; $sysPassword = $null
+    $keystorePassword = $null; $sysPassword = $null; $adminPassword = $null
     if ($restoreKeystore) {
         Write-Log -Level Info -Message 'Keystore will be restored from the backup - skipping the keystore password prompts.'
     } else {
         Write-Host "`nKeystore setup (optional - skip either to do keystore config interactively at the end):" -ForegroundColor Cyan
-        $keystorePassword = Read-OptionalSecurePassword -Prompt 'Agent keystore password'
+        $keystorePassword = Read-OptionalSecurePassword -Prompt "$(if ($nodeType -eq 'N') { 'Node' } else { 'Agent' }) keystore password"
         $sysPassword = Read-OptionalSecurePassword -Prompt "Cluster 'sys' user password"
+        # sksConfig.bat (Node) also sets the 'admin' user's password; aksConfig.bat (Agent) has no such option.
+        if ($nodeType -eq 'N') { $adminPassword = Read-OptionalSecurePassword -Prompt "Cluster 'admin' user password" }
+        foreach ($sec in @($keystorePassword, $sysPassword, $adminPassword)) {
+            if ($sec -and -not (Test-CmdSafeSecret -Secure $sec)) {
+                Write-Log -Level Warn -Message 'A keystore password contains characters that cannot be passed safely on the command line (allowed: letters, digits and @#$*_+-[]{}:./?~). Keystore generation will be deferred: run the keystore script yourself at the end.'
+                break
+            }
+        }
     }
     return [pscustomobject]@{
         NodeType           = $nodeType
@@ -1479,6 +1496,7 @@ function Read-InstallInterview {
         InstallService     = $installService
         KeystorePassword   = $keystorePassword
         SysPassword        = $sysPassword
+        AdminPassword      = $adminPassword
         RestoreFrom        = $(if ($restoreBackup) { $restoreBackup.Path } else { $null })
         RestoreKeystore    = $restoreKeystore
     }
@@ -1545,7 +1563,7 @@ function New-InstallPlan {
             & $add "Restore $restoreWhat from $($Interview.RestoreFrom)"
         }
         $pwNote = if ($Interview.RestoreKeystore) { 'restored from backup - generation will be skipped' }
-                  elseif ($Interview.KeystorePassword -and $Interview.SysPassword) { 'passwords provided' }
+                  elseif (Test-KeystorePasswordsProvided -Interview $Interview) { 'passwords provided' }
                   else { 'DEFERRED - you will run this yourself after the install' }
         & $add "Generate keystore via $(Split-Path $artifacts.KeystoreScript -Leaf)  ($pwNote)"
         if (@($Interview.Drivers).Count -gt 0) {
@@ -1615,16 +1633,17 @@ function ConvertTo-PlanDocument {
     # same user's elevated process, useless to anyone else or any other machine).
     param([Parameter(Mandatory)][object]$Plan)
     $iv = $Plan.Interview
-    $ksEnc = $null; $sysEnc = $null
+    $ksEnc = $null; $sysEnc = $null; $adminEnc = $null
     if ($iv.KeystorePassword) { $ksEnc = ConvertFrom-SecureString -SecureString $iv.KeystorePassword }
     if ($iv.SysPassword) { $sysEnc = ConvertFrom-SecureString -SecureString $iv.SysPassword }
+    if ($iv.PSObject.Properties['AdminPassword'] -and $iv.AdminPassword) { $adminEnc = ConvertFrom-SecureString -SecureString $iv.AdminPassword }
     $interviewDoc = [pscustomobject]@{
         NodeType = $iv.NodeType; Version = $iv.Version; InstallPath = $iv.InstallPath
         ClusterName = $iv.ClusterName; ServerAddress = $iv.ServerAddress
         HttpsEnabled = $iv.HttpsEnabled; AuthPort = $iv.AuthPort; ClusterReachable = $iv.ClusterReachable
         NodeLicense = $iv.NodeLicense; MemMax = $iv.MemMax; MemMin = $iv.MemMin; IntegratedSecurity = $iv.IntegratedSecurity
         Drivers = @($iv.Drivers); InstallService = $iv.InstallService
-        KeystorePasswordEnc = $ksEnc; SysPasswordEnc = $sysEnc
+        KeystorePasswordEnc = $ksEnc; SysPasswordEnc = $sysEnc; AdminPasswordEnc = $adminEnc
         RestoreFrom = $iv.RestoreFrom; RestoreKeystore = [bool]$iv.RestoreKeystore
     }
     $uninstallDoc = if ($Plan.PSObject.Properties['Uninstall']) { $Plan.Uninstall } else { $null }
@@ -1640,16 +1659,17 @@ function ConvertTo-PlanDocument {
 function ConvertFrom-PlanDocument {
     param([Parameter(Mandatory)][object]$Document)
     $iv = $Document.Interview
-    $ks = $null; $sys = $null
+    $ks = $null; $sys = $null; $admin = $null
     if ($iv.KeystorePasswordEnc) { $ks = ConvertTo-SecureString -String $iv.KeystorePasswordEnc }
     if ($iv.SysPasswordEnc) { $sys = ConvertTo-SecureString -String $iv.SysPasswordEnc }
+    if ($iv.PSObject.Properties['AdminPasswordEnc'] -and $iv.AdminPasswordEnc) { $admin = ConvertTo-SecureString -String $iv.AdminPasswordEnc }
     $interview = [pscustomobject]@{
         NodeType = $iv.NodeType; Version = $iv.Version; InstallPath = $iv.InstallPath
         ClusterName = $iv.ClusterName; ServerAddress = $iv.ServerAddress
         HttpsEnabled = [bool]$iv.HttpsEnabled; AuthPort = [int]$iv.AuthPort; ClusterReachable = [bool]$iv.ClusterReachable
         NodeLicense = $iv.NodeLicense; MemMax = $iv.MemMax; MemMin = $iv.MemMin; IntegratedSecurity = [bool]$iv.IntegratedSecurity
         Drivers = @($iv.Drivers); InstallService = [bool]$iv.InstallService
-        KeystorePassword = $ks; SysPassword = $sys
+        KeystorePassword = $ks; SysPassword = $sys; AdminPassword = $admin
         RestoreFrom = $iv.RestoreFrom; RestoreKeystore = [bool]$iv.RestoreKeystore
     }
     $uninstall = if ($Document.PSObject.Properties['Uninstall']) { $Document.Uninstall } else { $null }
@@ -2400,6 +2420,121 @@ function Get-ServiceWrapperZipPath {
     return Join-Path $script:DownloadDir $zipName
 }
 
+function Get-Java17ExePath {
+    # Full path to a JDK 17 java.exe (JAVA_HOME first, then PATH), or $null.
+    # Plain assignment, not @(...): Find-JavaInstallations already returns ,@(...), and wrapping it
+    # again nests the list, so the filters below match the whole list and .Path becomes an array.
+    $findings = Find-JavaInstallations
+    $home17 = $findings | Where-Object { $_.Source -eq 'JAVA_HOME' -and $_.Major -eq 17 } | Select-Object -First 1
+    if ($home17) { return (Join-Path $home17.Path 'bin\java.exe') }
+    $path17 = $findings | Where-Object { $_.Source -eq 'PATH' -and $_.Major -eq 17 } | Select-Object -First 1
+    if ($path17) { return $path17.Path }
+    return $null
+}
+
+function Set-WrapperTemplateJavaCommand {
+    # Root cause of the bare 'java.exe' service ImagePath: every Striim yajsw template
+    # (wrapper.conf.agent; wrapper.conf.server and wrapper.conf.derby on a Node) ships
+    # 'wrapper.java.command = java'. yajsw's WindowsJavaHome.findJava() returns a relative command
+    # unchanged, so the service is registered as 'java.exe ...' whatever JAVA_HOME or PATH say at
+    # install time. The SCM then resolves it against the PATH services.exe had at boot: that fails
+    # after a fresh JDK install, and can pick up an older Java first.
+    # Point the templates at the full JDK 17 path before the setup script copies them into
+    # wrapper.conf. yajsw then registers the quoted full path, and the application JVM it launches
+    # uses the same java.exe. Backslashes are doubled: wrapper.conf is a properties file, and the
+    # setup scripts escape <working-dir> the same way.
+    param([Parameter(Mandatory)][string]$ServiceConfigDir, [Parameter(Mandatory)][string]$JavaExe)
+    $templates = @(Get-ChildItem -LiteralPath $ServiceConfigDir -Recurse -File -Filter 'wrapper.conf.*' -ErrorAction SilentlyContinue)
+    if ($templates.Count -eq 0) { throw "No yajsw wrapper.conf.* template found under $ServiceConfigDir." }
+    $line = 'wrapper.java.command = ' + ($JavaExe -replace '\\', '\\')
+    foreach ($t in $templates) {
+        $found = $false
+        $out = @(Get-Content -LiteralPath $t.FullName | ForEach-Object {
+            if ($_ -match '^\s*wrapper\.java\.command\s*=') { $found = $true; $line } else { $_ }
+        })
+        if (-not $found) { $out += $line }
+        Set-Content -LiteralPath $t.FullName -Value $out -Encoding Default
+    }
+}
+
+function Split-ServiceCommandLine {
+    # Win32_Service.PathName -> executable + the rest of the command line, verbatim. Unlike
+    # ConvertFrom-ServicePathName this keeps an UNQUOTED path with spaces whole when it ends in
+    # java.exe/javaw.exe (the form the regedit workaround usually leaves behind).
+    param([Parameter(Mandatory)][string]$PathName)
+    if ($PathName -match '^"(?<exe>[^"]+)"(?<rest>.*)$') { return [pscustomobject]@{ Exe = $Matches['exe']; Rest = $Matches['rest']; Quoted = $true } }
+    if ($PathName -match '^(?<exe>.*?javaw?\.exe)(?<rest>(\s.*)?)$') { return [pscustomobject]@{ Exe = $Matches['exe']; Rest = $Matches['rest']; Quoted = $false } }
+    $exe = ($PathName -split '\s+')[0]
+    return [pscustomobject]@{ Exe = $exe; Rest = $PathName.Substring($exe.Length); Quoted = $false }
+}
+
+function Get-ExpectedYajswServiceNames {
+    # The SCM names this profile's setup script registers: wrapper.ntservice.name from each yajsw
+    # template beside it (Agent: wrapper.conf.agent; Node: wrapper.conf.server + wrapper.conf.derby).
+    param([Parameter(Mandatory)][string]$ServiceConfigDir)
+    $names = foreach ($t in @(Get-ChildItem -LiteralPath $ServiceConfigDir -File -Filter 'wrapper.conf.*' -ErrorAction SilentlyContinue)) {
+        foreach ($l in @(Get-Content -LiteralPath $t.FullName)) {
+            if ($l -match '^\s*wrapper\.ntservice\.name\s*=\s*(\S.*?)\s*$') { $Matches[1]; break }
+        }
+    }
+    return @($names | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Test-ServiceOwnedBy {
+    # True when the service's yajsw config file lives inside this installation's service folder
+    # (directory boundary, so conf\windowsService-old does not match conf\windowsService).
+    param([Parameter(Mandatory)][string]$PathName, [Parameter(Mandatory)][string]$ServiceConfigDir)
+    $prefix = '-Dwrapper.config=' + $ServiceConfigDir.TrimEnd('\') + '\'
+    return $PathName.IndexOf($prefix, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Test-YajswServiceSet {
+    # Read-only. Every service the profile registers (Get-ExpectedYajswServiceNames) exists, belongs
+    # to this installation, and starts an existing, rooted, safely quoted executable. Used after
+    # setup and as the service step's idempotence check, so a missing or bare Derby fails both.
+    param([Parameter(Mandatory)][string]$ServiceConfigDir)
+    $names = @(Get-ExpectedYajswServiceNames -ServiceConfigDir $ServiceConfigDir)
+    if ($names.Count -eq 0) { return $false }
+    foreach ($n in $names) {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+        if ($null -eq $svc -or -not $svc.PathName) { return $false }
+        if (-not (Test-ServiceOwnedBy -PathName $svc.PathName -ServiceConfigDir $ServiceConfigDir)) { return $false }
+        $cmd = Split-ServiceCommandLine -PathName $svc.PathName
+        if (-not [System.IO.Path]::IsPathRooted($cmd.Exe)) { return $false }
+        if (-not (Test-Path -LiteralPath $cmd.Exe)) { return $false }
+        if (-not $cmd.Quoted -and $cmd.Exe -match '\s') { return $false }
+    }
+    return $true
+}
+
+function Repair-ServiceJavaPath {
+    # Safety net after registration. Only the services this profile's setup script registers
+    # (Get-ExpectedYajswServiceNames: Agent; Striim + Derby on a Node - Striim depends on Derby), and
+    # only when their yajsw config lives in this installation (Test-ServiceOwnedBy):
+    #   bare java / java.exe / javaw.exe  -> "<JavaExe>" ...   (the regedit workaround, via the SCM)
+    #   unquoted rooted path with spaces  -> the same path, quoted
+    # Everything else is left alone: absent services, other installations' services, non-Java bare
+    # executables. Test-YajswServiceSet then decides whether the registration is good.
+    param([Parameter(Mandatory)][string]$ServiceConfigDir, [Parameter(Mandatory)][string]$JavaExe)
+    foreach ($n in @(Get-ExpectedYajswServiceNames -ServiceConfigDir $ServiceConfigDir)) {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+        if ($null -eq $svc -or -not $svc.PathName) { continue }
+        if (-not (Test-ServiceOwnedBy -PathName $svc.PathName -ServiceConfigDir $ServiceConfigDir)) { continue }
+        $cmd = Split-ServiceCommandLine -PathName $svc.PathName
+        $newExe = $null
+        if (-not [System.IO.Path]::IsPathRooted($cmd.Exe)) {
+            if ($cmd.Exe -match '^javaw?(\.exe)?$') { $newExe = $JavaExe }
+        } elseif (-not $cmd.Quoted -and $cmd.Exe -match '\s' -and (Test-Path -LiteralPath $cmd.Exe)) {
+            $newExe = $cmd.Exe
+        }
+        if ($null -eq $newExe) { continue }
+        $newPathName = '"{0}"{1}' -f $newExe, $cmd.Rest
+        $r = Invoke-CimMethod -InputObject $svc -MethodName Change -Arguments @{ PathName = $newPathName }
+        if ($r.ReturnValue -ne 0) { throw "Could not update service '$($svc.Name)' command line (Win32_Service.Change returned $($r.ReturnValue))." }
+        Write-Log -Level Warn -Message "Service '$($svc.Name)' started with '$($cmd.Exe)'; it now starts `"$newExe`"."
+    }
+}
+
 function Install-StriimService {
     # yajsw setup scripts require the CURRENT LOCATION to be their folder when invoked (field lore).
     # Always deregister any existing registration first (no-op if none) - a stale service left over
@@ -2418,12 +2553,30 @@ function Install-StriimService {
     Expand-StriimArchive -ZipPath $zipPath -Destination $serviceConfigDir -PreserveNames @()
     $setupScript = Join-Path $serviceConfigDir $artifacts.ServiceSetupScript
     if (-not (Test-Path $setupScript)) { throw "Setup script $($artifacts.ServiceSetupScript) not found after extraction." }
+    $javaExe = Get-Java17ExePath
+    if (-not $javaExe) { throw 'Java 17 was not found on JAVA_HOME or PATH; the service cannot be registered with a full java.exe path.' }
+    Set-WrapperTemplateJavaCommand -ServiceConfigDir $serviceConfigDir -JavaExe $javaExe
+    # yajsw's own installer JVM (bat\setenv.bat) runs %JAVA_HOME%\bin\java, else 'java' from PATH.
+    # Point JAVA_HOME at the JDK only when <home>\bin\java.exe exists - a PATH shim such as Oracle's
+    # ...\Common Files\Oracle\Java\javapath\java.exe has no such layout, and setenv.bat would then
+    # run a java that does not exist - otherwise unset it so setenv.bat uses PATH. Restore it after,
+    # so the Verify phase reports the machine's real JAVA_HOME, not this temporary value.
+    $oldJavaHome = $env:JAVA_HOME
+    $candidateHome = Split-Path (Split-Path $javaExe -Parent) -Parent
+    $env:JAVA_HOME = if (Test-Path -LiteralPath (Join-Path $candidateHome 'bin\java.exe')) { $candidateHome } else { $null }
     Push-Location $serviceConfigDir
     try {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setupScript
         if ($LASTEXITCODE -ne 0) { throw "Service setup script exited with code $LASTEXITCODE." }
     } finally {
         Pop-Location
+        $env:JAVA_HOME = $oldJavaHome
+    }
+    # setupWindows*.ps1 does not pass installService.bat's exit code on, so check the result itself.
+    Repair-ServiceJavaPath -ServiceConfigDir $serviceConfigDir -JavaExe $javaExe
+    if (-not (Test-YajswServiceSet -ServiceConfigDir $serviceConfigDir)) {
+        $expected = (Get-ExpectedYajswServiceNames -ServiceConfigDir $serviceConfigDir) -join ', '
+        throw "After $($artifacts.ServiceSetupScript), not every expected service ($expected) is registered for $serviceConfigDir with a full java.exe path."
     }
 }
 
@@ -2447,9 +2600,11 @@ function New-ServiceStep {
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
     $iv = $Plan.Interview
     return New-InstallStep -Name "Register '$($artifacts.ServiceName)' Windows service" -Test {
-        $svc = Get-StriimServiceCim -ServiceName $artifacts.ServiceName
-        if ($null -eq $svc) { return $false }
-        if ($null -eq (Resolve-ServiceExePath -PathName $svc.PathName)) { return $false }
+        # Every service the profile registers (Node: Striim AND Derby) must exist, belong to this
+        # installation and start a rooted java.exe. A bare 'java.exe' can resolve via PATH here yet
+        # not for the SCM at start time (it uses the PATH services.exe had at boot): treat as broken
+        # so a reinstall/upgrade re-registers it.
+        if (-not (Test-YajswServiceSet -ServiceConfigDir (Join-Path $iv.InstallPath $artifacts.ServiceConfigDir))) { return $false }
         $null -ne (Resolve-WrapperConfPath -InstallPath $iv.InstallPath -NodeType $iv.NodeType)
     }.GetNewClosure() -Action {
         Install-StriimService -Plan $Plan
@@ -2468,6 +2623,32 @@ function New-WrapperSyncStep {
     }.GetNewClosure() -Action {
         [void](Update-WrapperConfFromInterview -Interview $iv)
     }.GetNewClosure()
+}
+
+function Test-CmdSafeSecret {
+    # True when a password survives being passed inside "..." to a .bat via cmd.exe /c unchanged.
+    # cmd expands %VAR% (and !VAR!), and " & | < > ^ end or alter the argument - part of the secret
+    # could then run as a command or reach the console and the transcript. Conservative allowlist;
+    # never logs the value.
+    param([Parameter(Mandatory)][securestring]$Secure)
+    $plain = ConvertTo-PlainText -Secure $Secure
+    try { return [bool]($plain -cmatch '^[A-Za-z0-9@#$*_+\-\[\]{}:./?~]+$') } finally { $plain = $null }
+}
+
+function Test-KeystorePasswordsProvided {
+    # Non-interactive keystore generation needs every password the profile's script takes, each
+    # cmd-safe (Test-CmdSafeSecret): Agent aksConfig.bat: keystore + sys. Node sksConfig.bat:
+    # keystore + sys + admin. False means the keystore step is deferred to the interactive script -
+    # the plan card, the step and Invoke-KeystoreConfig all decide with this one function.
+    param([Parameter(Mandatory)][object]$Interview)
+    if (-not ($Interview.KeystorePassword -and $Interview.SysPassword)) { return $false }
+    $secrets = @($Interview.KeystorePassword, $Interview.SysPassword)
+    if ($Interview.NodeType -eq 'N') {
+        if (-not ($Interview.PSObject.Properties['AdminPassword'] -and $Interview.AdminPassword)) { return $false }
+        $secrets += $Interview.AdminPassword
+    }
+    foreach ($sec in $secrets) { if (-not (Test-CmdSafeSecret -Secure $sec)) { return $false } }
+    return $true
 }
 
 function Invoke-KeystoreConfig {
@@ -2502,9 +2683,10 @@ function Invoke-KeystoreConfig {
     }
     Push-Location $iv.InstallPath
     try {
-        if ($iv.KeystorePassword -and $iv.SysPassword) {
+        if (Test-KeystorePasswordsProvided -Interview $iv) {
             $ksPlain = ConvertTo-PlainText -Secure $iv.KeystorePassword
             $sysPlain = ConvertTo-PlainText -Secure $iv.SysPassword
+            $adminPlain = if ($iv.NodeType -eq 'N') { ConvertTo-PlainText -Secure $iv.AdminPassword } else { $null }
             try {
                 # aksConfig.bat takes flagged arguments only - its :PROCESSARGS loop reads
                 # option/value pairs and rejects anything that is not -h/-?/-p/-k:
@@ -2516,9 +2698,17 @@ function Invoke-KeystoreConfig {
                 # The flags also set COMMAND_LINE_ARGS_PASSED, which the script forwards as
                 # -Dstriim.cluster.argsPassed; that is what selects non-interactive mode. Positional
                 # args therefore could never have worked, regardless of parsing.
-                & cmd.exe /c "`"$batPath`" -k `"$ksPlain`" -p `"$sysPlain`""
+                #
+                # The Node's sksConfig.bat uses different letters: -s is the sys password and -p is the
+                # MDR (metadata repository) password, so the Agent's '-p sys' would set the wrong one.
+                #   Usage: "sksConfig.bat" [-a Admin Password] [-s Sys Password] [-k KeyStore Password] ...
+                if ($iv.NodeType -eq 'N') {
+                    & cmd.exe /c "`"$batPath`" -k `"$ksPlain`" -s `"$sysPlain`" -a `"$adminPlain`""
+                } else {
+                    & cmd.exe /c "`"$batPath`" -k `"$ksPlain`" -p `"$sysPlain`""
+                }
             } finally {
-                $ksPlain = $null; $sysPlain = $null
+                $ksPlain = $null; $sysPlain = $null; $adminPlain = $null
             }
         } else {
             Write-Log -Level Info -Message 'One final step needs your input: keystore configuration.'
@@ -2575,7 +2765,7 @@ function New-KeystoreStep {
     $artifacts = Get-ProfileArtifacts -NodeType $Plan.Interview.NodeType
     $iv = $Plan.Interview
     $scriptLeaf = Split-Path $artifacts.KeystoreScript -Leaf
-    $hasPasswords = [bool]($iv.KeystorePassword -and $iv.SysPassword)
+    $hasPasswords = Test-KeystorePasswordsProvided -Interview $iv
     $stepName = if ($hasPasswords) { "Generate keystore via $scriptLeaf" }
                 else { "Keystore via $scriptLeaf (deferred - needs your input after this run)" }
     return New-InstallStep -Name $stepName -Test {
@@ -2911,7 +3101,7 @@ function Show-NextSteps {
         Write-Host ''
         Write-Host '  ACTION REQUIRED - the keystore has not been generated yet.' -ForegroundColor Yellow
         if ($script:KeystoreDeferred) {
-            Write-Host '  You skipped the keystore and sys passwords, so this step needs a terminal.'
+            Write-Host '  A keystore password was skipped, or cannot be passed on the command line, so this step needs a terminal.'
         } else {
             Write-Host '  The keystore step did not complete.'
         }
@@ -2921,7 +3111,8 @@ function Show-NextSteps {
         Write-Host ("    cd `"{0}`"" -f $Plan.Interview.InstallPath)
         Write-Host ("    `"{0}`"" -f $ksBat)
         Write-Host ''
-        Write-Host ("  It will prompt for the keystore password and the cluster 'sys' password, then")
+        $pwList = if ($Plan.Interview.NodeType -eq 'N') { "the keystore password and the cluster 'sys' and 'admin' passwords" } else { "the keystore password and the cluster 'sys' password" }
+        Write-Host ("  It will prompt for {0}, then" -f $pwList)
         Write-Host ("  create {0} and {1}." -f $ksArtifacts.JksFile, $ksArtifacts.PwdFile)
         Write-Host ("  The service will not start until those files exist.") -ForegroundColor Yellow
         if ($Plan.Interview.ServerAddress -and $Plan.Interview.ServerAddress -match ',') {
@@ -3347,6 +3538,7 @@ function ConvertTo-InterviewFromInstall {
         InstallService = ($Install.ServiceState -ne 'not registered')
         KeystorePassword = $null
         SysPassword = $null
+        AdminPassword = $null
         RestoreFrom = $null
         RestoreKeystore = $false
     }
@@ -4133,6 +4325,9 @@ function Invoke-PlanExecution {
         Start-InstallTranscript -InstallPath $iv.InstallPath | Out-Null
     }
     try {
+        # The elevated process inherits the launching shell's environment, which can predate a machine-wide
+        # Java install (JAVA_HOME/PATH). The Java probes and yajsw's installer JVM read that environment.
+        Update-SessionEnvironment
         # Echo interview answers into the transcript - passwords excluded by construction.
         Write-Log -Level Info -Message ("Plan: mode={0} version={1} path={2} cluster={3} server={4}:{5} service={6} integratedSecurity={7} drivers=[{8}]" -f `
             $Plan.Mode, $iv.Version, $iv.InstallPath, $iv.ClusterName, $iv.ServerAddress, $iv.AuthPort, $iv.InstallService, $iv.IntegratedSecurity, (@($iv.Drivers | ForEach-Object { $_.Key }) -join ','))
